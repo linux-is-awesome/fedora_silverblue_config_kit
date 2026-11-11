@@ -32,7 +32,7 @@ install_dropin() {
   local tmp
   tmp="$(mktemp)"
   cat >"${tmp}" <<'EOF'
-# Installed by fedora_silverblue_config/scripts/enable-sudo-pwfeedback
+# Installed by enable-sudo-pwfeedback
 # Echo '*' for each character typed at the sudo password prompt.
 Defaults pwfeedback
 EOF

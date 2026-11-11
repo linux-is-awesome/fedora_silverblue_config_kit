@@ -127,17 +127,8 @@ run_script() {
 }
 
 prompt_backup_dir() {
-  local default="" dir
-  if [[ -d "/run/media/${USER}/External/Backups" ]]; then
-    default="/run/media/${USER}/External/Backups"
-  fi
-
-  if [[ -n "${default}" ]]; then
-    read -r -p "Backup directory [${default}]: " dir
-    dir="${dir:-${default}}"
-  else
-    read -r -p "Backup directory: " dir
-  fi
+  local dir
+  read -r -p "Backup directory: " dir
   [[ -n "${dir}" ]] || die "backup directory is required"
   printf '%s\n' "${dir}"
 }

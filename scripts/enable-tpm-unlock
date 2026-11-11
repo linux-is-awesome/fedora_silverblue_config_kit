@@ -3,7 +3,7 @@
 # This does NOT store your passphrase in BIOS/UEFI. It seals a separate
 # unlock key to the TPM (systemd-cryptenroll). Your passphrase slot stays.
 #
-# Trade-off: anyone who can boot this same laptop past firmware can unlock
+# Trade-off: anyone who can boot this same machine past firmware can unlock
 # the disk without knowing the passphrase. Keep a strong passphrase + header backup.
 set -euo pipefail
 
@@ -30,9 +30,9 @@ Options / environment:
 
 Examples:
   enable-tpm-unlock
-  enable-tpm-unlock /dev/nvme0n1p4
-  enable-tpm-unlock --pcrs 7+14 /dev/nvme0n1p4
-  enable-tpm-unlock --unenroll /dev/nvme0n1p4
+  enable-tpm-unlock /dev/sdXN
+  enable-tpm-unlock --pcrs 7+14 /dev/sdXN
+  enable-tpm-unlock --unenroll /dev/sdXN
 EOF
 }
 

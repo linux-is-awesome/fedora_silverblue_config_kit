@@ -11,7 +11,7 @@ POLKIT_STOCK="${POLKIT_STOCK:-/usr/lib/pam.d/polkit-1}"
 POLKIT_PAM="${POLKIT_PAM:-/etc/pam.d/polkit-1}"
 # Shared auth stack used by the patched auth include lines.
 NOFP_AUTH="${NOFP_AUTH:-/etc/pam.d/nofingerprint-auth}"
-MARKER="# fedora_silverblue_config: no fingerprint for elevation"
+MARKER="# disable-sudo-fingerprint: no fingerprint for elevation"
 
 usage() {
   cat <<'EOF'
@@ -122,47 +122,11 @@ restore_auth_include() {
   printf 'Restored auth include in %s\n' "${dst}"
 }
 
-# Older version of this script replaced the whole sudo file. Put stock back
-# first so we can do a one-line retarget instead.
-migrate_legacy_sudo_override() {
-  local bak="/etc/pam.d/sudo.fedora-silverblue-config.bak"
-  if [[ -f "${bak}" ]]; then
-    as_root mv -f "${bak}" "${SUDO_PAM}"
-    printf 'Restored stock %s from legacy backup\n' "${SUDO_PAM}"
-    return 0
-  fi
-  if [[ -f "${SUDO_PAM}" ]] \
-    && grep -q 'disable-sudo-fingerprint' "${SUDO_PAM}" \
-    && ! grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+(system-auth|nofingerprint-auth)' "${SUDO_PAM}"; then
-    local tmp
-    tmp="$(mktemp)"
-    cat >"${tmp}" <<'EOF'
-#%PAM-1.0
-auth       include      system-auth
-account    include      system-auth
-password   include      system-auth
-session    optional     pam_keyinit.so revoke
-session    required     pam_limits.so
-session    include      system-auth
-EOF
-    as_root install -m 644 "${tmp}" "${SUDO_PAM}"
-    rm -f "${tmp}"
-    printf 'Replaced legacy full sudo PAM override with stock template\n'
-  fi
-}
-
 apply() {
-  migrate_legacy_sudo_override
   install_nofp_fragment
   retarget_auth_include "${SUDO_PAM}" "${SUDO_PAM}"
 
   # polkit stock is under /usr/lib; /etc/pam.d/polkit-1 overrides it.
-  # If a legacy full override exists, start from stock then retarget one line.
-  if [[ -f "${POLKIT_PAM}" ]] \
-    && grep -q 'disable-sudo-fingerprint' "${POLKIT_PAM}" \
-    && ! grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+(system-auth|nofingerprint-auth)' "${POLKIT_PAM}"; then
-    as_root rm -f "${POLKIT_PAM}"
-  fi
   if [[ -f "${POLKIT_PAM}" ]]; then
     retarget_auth_include "${POLKIT_PAM}" "${POLKIT_PAM}"
   else

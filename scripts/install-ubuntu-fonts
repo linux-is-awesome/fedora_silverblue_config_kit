@@ -170,7 +170,7 @@ main() {
   install_fonts_from_zip "${tmp}/ubuntu-sans-mono.zip" "${dest}" "ubuntu-sans-mono"
 
   printf 'Refreshing font cache...\n'
-  as_root fc-cache -f "${dest}" >/dev/null
+  fc-cache -f
 
   printf '\nOK: Ubuntu fonts installed under %s\n' "${dest}"
   if [[ "${dest}" == "${DEFAULT_SYSTEM_DIR}" || "${mode}" == "system" ]]; then

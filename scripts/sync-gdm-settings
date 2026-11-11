@@ -17,10 +17,8 @@
 # Does not modify your user session — only GDM system config.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DCONF_COPY="${SCRIPT_DIR}/../config/dconf/gdm/00-synced-from-user"
 GDM_DCONF_DST="/etc/dconf/db/gdm.d/00-synced-from-user"
-GDM_MONITORS_LEGACY="/var/lib/gdm/.config/monitors.xml"
+GDM_MONITORS_HOME="/var/lib/gdm/.config/monitors.xml"
 GDM_MONITORS_XDG="/etc/xdg/monitors.xml"
 BOOT_SYNC_DROPIN="/etc/systemd/system/gdm.service.d/10-sync-monitors.conf"
 
@@ -165,12 +163,12 @@ sync_monitors() {
   [[ -n "${gdm_home}" ]] || die "gdm user not found"
 
   as_root install -d -o gdm -g gdm -m 755 "${gdm_home}/.config"
-  as_root install -o gdm -g gdm -m 644 "${src}" "${GDM_MONITORS_LEGACY}"
+  as_root install -o gdm -g gdm -m 644 "${src}" "${GDM_MONITORS_HOME}"
 
   as_root install -d -m 755 /etc/xdg
   as_root install -o root -g root -m 644 "${src}" "${GDM_MONITORS_XDG}"
 
-  printf 'Synced monitors.xml →\n  %s\n  %s\n' "${GDM_MONITORS_LEGACY}" "${GDM_MONITORS_XDG}"
+  printf 'Synced monitors.xml →\n  %s\n  %s\n' "${GDM_MONITORS_HOME}" "${GDM_MONITORS_XDG}"
 }
 
 sync_dconf() {
@@ -184,14 +182,7 @@ sync_dconf() {
   as_root install -d -m 755 /etc/dconf/db/gdm.d
   as_root install -m 644 "${tmp}" "${GDM_DCONF_DST}"
 
-  mkdir -p "$(dirname -- "${PROJECT_DCONF_COPY}")"
-  cp -f "${tmp}" "${PROJECT_DCONF_COPY}"
   rm -f "${tmp}"
-
-  if [[ -f /etc/dconf/db/gdm.d/00-ubuntu-fonts ]]; then
-    as_root rm -f /etc/dconf/db/gdm.d/00-ubuntu-fonts
-    printf 'Removed obsolete /etc/dconf/db/gdm.d/00-ubuntu-fonts\n'
-  fi
 
   as_root dconf update
   printf 'Synced desktop settings → %s\n' "${GDM_DCONF_DST}"

@@ -10,7 +10,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONF_SRC="${SCRIPT_DIR}/../config/fontconfig/99-ubuntu-look.conf"
 CONF_DST="/etc/fonts/conf.d/99-ubuntu-look.conf"
-CONF_NAME="99-ubuntu-look.conf"
 
 # Ubuntu desktop-ish defaults.
 UI_FONT="${UI_FONT:-Ubuntu 11}"
@@ -24,11 +23,6 @@ Usage: configure-ubuntu-fonts
 
   Installs fontconfig rules and configures GNOME session fonts
   for an Ubuntu-like look.
-
-  Also copies the fontconfig drop-in to:
-    ~/.config/fontconfig/conf.d/
-    ~/.containers/work_container/home/.config/fontconfig/conf.d/
-      (when that work-container home exists)
 
   For the login screen (GDM), including monitors: run sync-gdm-settings.
 
@@ -59,42 +53,13 @@ ensure_ubuntu_fonts_present() {
   fc-list "DejaVu Sans Mono" file >/dev/null 2>&1 || die "DejaVu Sans Mono not found; run install-dejavu-fonts first"
 }
 
-install_user_fontconfig() {
-  # install_user_fontconfig HOME_DIR
-  # User-level drop-in (no root). Cursor/VS Code in the work container use APP_HOME,
-  # which is not the same tree as host ~/.config unless we sync it explicitly.
-  local home_dir="$1"
-  local dest_dir dest
-  [[ -n "${home_dir}" && -d "${home_dir}" ]] || return 0
-  dest_dir="${home_dir}/.config/fontconfig/conf.d"
-  dest="${dest_dir}/${CONF_NAME}"
-  mkdir -p "${dest_dir}"
-  install -m 644 "${CONF_SRC}" "${dest}"
-  printf 'Installed %s\n' "${dest}"
-}
-
-work_container_home() {
-  # Prefer explicit override, then the usual Silverblue/toolbox layout under $HOME.
-  local candidate="${WORK_CONTAINER_HOME:-${HOME}/.containers/work_container/home}"
-  if [[ -d "${candidate}" ]]; then
-    printf '%s\n' "${candidate}"
-  fi
-}
-
 install_fontconfig() {
   [[ -f "${CONF_SRC}" ]] || die "missing config: ${CONF_SRC}"
   as_root install -d -m 755 /etc/fonts/conf.d
   as_root install -m 644 "${CONF_SRC}" "${CONF_DST}"
   printf 'Installed %s\n' "${CONF_DST}"
 
-  install_user_fontconfig "${HOME}"
-  local container_home
-  container_home="$(work_container_home || true)"
-  if [[ -n "${container_home}" && "${container_home}" != "${HOME}" ]]; then
-    install_user_fontconfig "${container_home}"
-  fi
-
-  as_root fc-cache -f >/dev/null || fc-cache -f >/dev/null || true
+  fc-cache -f
 }
 
 gset() {

@@ -190,10 +190,6 @@ main() {
         do_undo=1
         shift
         ;;
-      --no-flatpak)
-        # Kept so an old invocation does not hard-fail; Flatpak is never installed.
-        shift
-        ;;
       *)
         die "unknown argument: $1"
         ;;

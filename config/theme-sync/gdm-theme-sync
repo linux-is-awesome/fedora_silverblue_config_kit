@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Live-sync the active admin user's GNOME look into GDM + system GTK settings.ini.
-# Port of custom_distro gnome-theme-watchdog for Silverblue (+ appearance-key filter).
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,7 +103,7 @@ sync_theme() {
   update_symlinks 2>/dev/null || true
 }
 
-# Performance: original watchdog synced on every dconf write; only appearance keys.
+# Only react to appearance-related dconf keys.
 is_appearance_event() {
   case "$1" in
     */org/gnome/desktop/interface/gtk-theme* | \

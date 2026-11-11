@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install DejaVu fonts system-wide (visible to GDM and bind-mounted into the work container).
+# Install DejaVu fonts system-wide (visible to GDM).
 # Matches Ubuntu's default fontconfig monospace prefer (DejaVu Sans Mono first).
 set -euo pipefail
 
@@ -108,7 +108,7 @@ main() {
   done
 
   printf 'Refreshing font cache...\n'
-  as_root fc-cache -f "${dest}" >/dev/null
+  fc-cache -f
 
   printf '\nOK: DejaVu fonts installed under %s (%d files)\n' "${dest}" "${#fonts[@]}"
   fc-list "DejaVu Sans Mono" file family 2>/dev/null | sed 's/^/  /' || true

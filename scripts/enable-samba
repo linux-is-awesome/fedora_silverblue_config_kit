@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Samba usershare setup for Fedora Silverblue (Nautilus / net usershare style).
-# Port of custom_distro samba-config, adapted for Fedora package/service names.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +25,7 @@ usage() {
   cat <<'EOF'
 Usage: enable-samba [--configure-only] [--set-password] [--undo]
 
-  Layers Samba and configures usershares like the custom_distro setup:
+  Layers Samba and configures usershares:
 
     - samba + samba-usershares + tools
     - /etc/samba/smb.conf.d/99-desktop-share.conf (guest map, usershares, no homes)
@@ -163,9 +162,6 @@ install_dropin() {
   as_root bash -c '
     conf="'"${SMB_CONF}"'"
     dropin="'"${DROPIN_DST}"'"
-    # Drop mistaken EOF / glob includes from earlier installs.
-    sed -i "/Desktop usershare drop-ins (fedora_silverblue_config)/,+1d" "$conf"
-    sed -i "/^[[:space:]]*include[[:space:]]*=[[:space:]]*\/etc\/samba\/smb\.conf\.d\//d" "$conf"
     if ! awk -v dropin="$dropin" "
       /^\\[global\\]/{g=1; next}
       /^\\[/{g=0}

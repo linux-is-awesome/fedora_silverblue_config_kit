@@ -8,12 +8,12 @@ usage() {
 Usage: backup-luks-header <backup-dir> [device]
 
   backup-dir  Directory where the header image and .sha256 will be written
-  device      Optional LUKS block device (e.g. /dev/nvme0n1p4).
+  device      Optional LUKS block device (e.g. /dev/sdXN).
               If omitted, lists LUKS devices and asks you to pick one.
 
 Examples:
-  backup-luks-header /run/media/$USER/External/Backups
-  backup-luks-header /mnt/backups /dev/nvme0n1p4
+  backup-luks-header /run/media/$USER/usb/backups
+  backup-luks-header /mnt/backups /dev/sdXN
 EOF
 }
 

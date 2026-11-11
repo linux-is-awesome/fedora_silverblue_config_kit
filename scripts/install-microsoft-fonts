@@ -165,7 +165,7 @@ main() {
   as_root find "${dest}" -maxdepth 1 -type f -iname '*.ttf' -exec chmod 644 {} +
 
   printf 'Refreshing font cache...\n'
-  as_root fc-cache -f "${dest}" >/dev/null
+  fc-cache -f
 
   printf '\nOK: Microsoft fonts installed under %s (%d files)\n' "${dest}" "${#fonts[@]}"
   if [[ "${dest}" == "${DEFAULT_SYSTEM_DIR}" || "${mode}" == "system" ]]; then
