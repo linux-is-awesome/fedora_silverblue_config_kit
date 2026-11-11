@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Remove base-image packages on rpm-ostree systems (Silverblue/Kinoite/…).
+# Uses: rpm-ostree override remove  (persists across upgrades; undo with override reset)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_LIST="${SCRIPT_DIR}/../config/remove-base-apps.list"
+
+usage() {
+  cat <<'EOF'
+Usage: remove-base-apps [list-file]
+       remove-base-apps --packages pkg [pkg...]
+
+  Removes base-image RPMs via rpm-ostree override remove.
+  Reboot (or rpm-ostree apply-live) to use the new deployment.
+
+  list-file   Package list (default: config/remove-base-apps.list next to scripts/)
+              One package name per line; # comments and blank lines ignored.
+
+Examples:
+  remove-base-apps
+  remove-base-apps /path/to/apps.list
+  remove-base-apps --packages firefox firefox-langpacks yelp
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+read_list_file() {
+  local file="$1"
+  [[ -f "${file}" ]] || die "package list not found: ${file}"
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "${line}" ]] || continue
+    printf '%s\n' "${line}"
+  done <"${file}"
+}
+
+package_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+is_removed_in_status() {
+  local pkg="$1"
+  rpm-ostree status 2>/dev/null | grep -E 'RemovedBasePackages:.*\b'"${pkg}"'\b' >/dev/null 2>&1
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  need_cmd rpm-ostree
+  need_cmd rpm
+  need_cmd sudo
+
+  local -a packages=()
+  if [[ "${1:-}" == "--packages" ]]; then
+    shift
+    [[ "${#}" -ge 1 ]] || die "--packages requires at least one package name"
+    packages=("$@")
+  else
+    local list_file="${1:-${DEFAULT_LIST}}"
+    mapfile -t packages < <(read_list_file "${list_file}")
+    ((${#packages[@]} > 0)) || die "no packages listed in ${list_file}"
+    printf 'Using package list: %s\n' "${list_file}"
+  fi
+
+  local -a to_remove=() skipped=() missing=()
+  local pkg
+  for pkg in "${packages[@]}"; do
+    if is_removed_in_status "${pkg}"; then
+      skipped+=("${pkg}")
+      continue
+    fi
+    if package_installed "${pkg}"; then
+      to_remove+=("${pkg}")
+    else
+      missing+=("${pkg}")
+    fi
+  done
+
+  if ((${#skipped[@]} > 0)); then
+    printf 'Already removed (override): %s\n' "${skipped[*]}"
+  fi
+  if ((${#missing[@]} > 0)); then
+    printf 'Not installed (skipped): %s\n' "${missing[*]}"
+  fi
+
+  if ((${#to_remove[@]} == 0)); then
+    printf 'Nothing to remove.\n'
+    rpm-ostree status | sed -n '1,20p'
+    exit 0
+  fi
+
+  printf 'Will remove base packages:\n'
+  local p
+  for p in "${to_remove[@]}"; do
+    printf '  - %s (%s)\n' "${p}" "$(rpm -q "${p}")"
+  done
+
+  sudo rpm-ostree override remove "${to_remove[@]}"
+
+  printf '\nOK: staged removal. Reboot to apply (or: rpm-ostree apply-live).\n'
+  printf 'Undo later: sudo rpm-ostree override reset %s\n' "${to_remove[*]}"
+  printf '\nDeployment status:\n'
+  rpm-ostree status | sed -n '1,25p'
+}
+
+main "$@"

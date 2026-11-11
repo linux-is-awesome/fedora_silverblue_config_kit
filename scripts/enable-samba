@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# Samba usershare setup for Fedora Silverblue (Nautilus / net usershare style).
+# Port of custom_distro samba-config, adapted for Fedora package/service names.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../config/samba"
+SRC_CONF="${SRC_DIR}/99-desktop-share.conf"
+SMB_CONF="${SMB_CONF:-/etc/samba/smb.conf}"
+DROPIN_DST="${DROPIN_DST:-/etc/samba/smb.conf.d/99-desktop-share.conf}"
+USERSHARES_DIR="${USERSHARES_DIR:-/var/lib/samba/usershares}"
+# Fedora samba-usershares uses group "usershares" (Debian/Ubuntu: sambashare).
+USERSHARES_GROUP="${USERSHARES_GROUP:-usershares}"
+SYNC_LIB_DST="${SYNC_LIB_DST:-/usr/local/lib/samba-public-share}"
+USER_UNIT_DST="${USER_UNIT_DST:-/etc/systemd/user/samba-public-share.service}"
+USER_UNIT_NAME="samba-public-share.service"
+
+PKGS=(
+  samba
+  samba-usershares
+  samba-common-tools
+  cifs-utils
+)
+
+usage() {
+  cat <<'EOF'
+Usage: enable-samba [--configure-only] [--set-password] [--undo]
+
+  Layers Samba and configures usershares like the custom_distro setup:
+
+    - samba + samba-usershares + tools
+    - /etc/samba/smb.conf.d/99-desktop-share.conf (guest map, usershares, no homes)
+    - usershares dir (1770 root:usershares)
+    - add your user to the usershares group
+    - enable smb + nmb, open firewall "samba"
+    - SELinux booleans for sharing under home
+    - HOME_MODE 0711 so guests can traverse /home/<user>
+    - sync ~/Public Samba share with Settings → Sharing → File Sharing
+      (WebDAV + Samba Public together; smb stays enabled system-wide)
+
+  Extra shares (helpers installed under /usr/local/lib/samba-public-share/):
+    share-on /path/to/folder [SHARE_NAME]
+    share-off /path/to/folder|SHARE_NAME
+
+  Samba login password (optional; guests use Public without it):
+    re-run with --set-password   or:  smbpasswd -a "$USER"
+
+  --configure-only   Skip rpm-ostree; only apply config/services
+  --set-password     Run smbpasswd -a for the current user (interactive)
+  --undo             Remove Public sync unit + usershare + drop-in
+                     (does not uninstall layered RPMs or wipe smbpasswd)
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+target_user() {
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+    printf '%s\n' "${SUDO_USER}"
+  else
+    printf '%s\n' "${USER}"
+  fi
+}
+
+package_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+all_pkgs_installed() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || return 1
+  done
+  return 0
+}
+
+missing_pkgs() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || printf '%s\n' "${p}"
+  done
+}
+
+layer_packages() {
+  need_cmd rpm-ostree
+  need_cmd rpm
+  need_cmd sudo
+
+  if all_pkgs_installed; then
+    printf 'Packages already installed: %s\n' "${PKGS[*]}"
+    return 0
+  fi
+
+  local -a need=()
+  mapfile -t need < <(missing_pkgs)
+  printf 'Layering via rpm-ostree:\n'
+  local p
+  for p in "${need[@]}"; do
+    printf '  %s\n' "${p}"
+  done
+  as_root rpm-ostree install "${need[@]}"
+  printf '\nQueued. Reboot, then re-run: %s --configure-only\n' "$(basename -- "$0")"
+}
+
+ensure_usershares_group() {
+  # Silverblue: group may exist only in /usr/lib/group (getent still works).
+  # usermod -aG needs a writable /etc/group entry — copy it first if missing.
+  if ! grep -qE "^${USERSHARES_GROUP}:" /etc/group 2>/dev/null; then
+    if grep -qE "^${USERSHARES_GROUP}:" /usr/lib/group 2>/dev/null; then
+      printf 'Adding %s group to /etc/group...\n' "${USERSHARES_GROUP}"
+      as_root sh -c "grep -E '^${USERSHARES_GROUP}:' /usr/lib/group >> /etc/group"
+    elif [[ -f /usr/lib/sysusers.d/samba-usershares.conf ]]; then
+      as_root systemd-sysusers samba-usershares.conf 2>/dev/null \
+        || as_root groupadd --system "${USERSHARES_GROUP}"
+    else
+      as_root groupadd --system "${USERSHARES_GROUP}"
+    fi
+  fi
+
+  local user
+  user="$(target_user)"
+  [[ "${user}" != root ]] || die "refusing to configure samba for root; run as your user"
+
+  if getent group "${USERSHARES_GROUP}" | grep -qE "(^|:|,)${user}(,|$)"; then
+    printf 'User %s already in %s.\n' "${user}" "${USERSHARES_GROUP}"
+  else
+    as_root usermod -aG "${USERSHARES_GROUP}" "${user}"
+    printf 'Added %s to %s (log out/in for group to apply).\n' "${user}" "${USERSHARES_GROUP}"
+  fi
+}
+
+ensure_usershares_dir() {
+  as_root install -d -m 1770 -o root -g "${USERSHARES_GROUP}" "${USERSHARES_DIR}"
+  printf 'Usershares dir: %s (1770 root:%s)\n' "${USERSHARES_DIR}" "${USERSHARES_GROUP}"
+}
+
+install_dropin() {
+  [[ -f "${SRC_CONF}" ]] || die "missing ${SRC_CONF}"
+  [[ -f "${SMB_CONF}" ]] || die "missing ${SMB_CONF} (is samba installed?)"
+
+  as_root install -d -m 755 "$(dirname -- "${DROPIN_DST}")"
+  as_root install -m 644 "${SRC_CONF}" "${DROPIN_DST}"
+
+  # Include must be a concrete path under [global]. Samba does not expand
+  # smb.conf.d/*.conf globs, and an EOF include lands in [print$].
+  local include_line="	include = ${DROPIN_DST}"
+  as_root cp -a "${SMB_CONF}" "${SMB_CONF}.bak-before-desktop-share"
+  as_root bash -c '
+    conf="'"${SMB_CONF}"'"
+    dropin="'"${DROPIN_DST}"'"
+    # Drop mistaken EOF / glob includes from earlier installs.
+    sed -i "/Desktop usershare drop-ins (fedora_silverblue_config)/,+1d" "$conf"
+    sed -i "/^[[:space:]]*include[[:space:]]*=[[:space:]]*\/etc\/samba\/smb\.conf\.d\//d" "$conf"
+    if ! awk -v dropin="$dropin" "
+      /^\\[global\\]/{g=1; next}
+      /^\\[/{g=0}
+      g && /include[[:space:]]*=/ && index(\$0, dropin) {found=1}
+      END{exit !found}
+    " "$conf"; then
+      if grep -qE "^[[:space:]]*include[[:space:]]*=[[:space:]]*/etc/samba/usershares\\.conf" "$conf"; then
+        sed -i "/^[[:space:]]*include[[:space:]]*=[[:space:]]*\\/etc\\/samba\\/usershares\\.conf/a\\	include = ${dropin}" "$conf"
+      else
+        sed -i "/^\\[global\\]/a\\	include = ${dropin}" "$conf"
+      fi
+      printf "Added %s include under [global]\\n" "$dropin"
+    else
+      printf "%s include already under [global]\\n" "$dropin"
+    fi
+  '
+
+  # Disable [homes] in main file (include merge is unreliable for this).
+  if grep -q '^\[homes\]' "${SMB_CONF}"; then
+    as_root bash -c '
+      conf="'"${SMB_CONF}"'"
+      if ! awk "/^\\[homes\\]/{p=1} p&&/^\\[/{if(!/^\\[homes\\]/)exit} p&&/available/" "$conf" | grep -q .; then
+        sed -i "/^\\[homes\\]/a\\	available = no" "$conf"
+      else
+        sed -i "/^\\[homes\\]/,/^\\[/{s/^[[:space:]]*available[[:space:]]*=.*/	available = no/}" "$conf"
+      fi
+    '
+  fi
+}
+
+set_home_mode() {
+  # Guests need execute on /home/<user> to reach a shared subfolder.
+  if [[ -f /etc/login.defs ]] && grep -qE '^HOME_MODE' /etc/login.defs; then
+    as_root sed -i 's/^HOME_MODE[[:space:]].*/HOME_MODE\t0711/' /etc/login.defs
+    printf 'Set HOME_MODE 0711 in /etc/login.defs (new homes).\n'
+  fi
+
+  local user home
+  user="$(target_user)"
+  home="$(getent passwd "${user}" | cut -d: -f6)"
+  if [[ -d "${home}" ]]; then
+    local mode
+    mode="$(stat -c '%a' "${home}")"
+    if [[ "${mode}" != "711" && "${mode}" != "755" ]]; then
+      as_root chmod 0711 "${home}"
+      printf 'chmod 0711 %s (was %s) so guests can traverse to shares.\n' "${home}" "${mode}"
+    fi
+  fi
+}
+
+configure_selinux() {
+  if ! command -v getenforce >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ "$(getenforce 2>/dev/null || true)" == "Disabled" ]] && return 0
+  if command -v setsebool >/dev/null 2>&1; then
+    as_root setsebool -P samba_enable_home_dirs on 2>/dev/null || true
+    as_root setsebool -P samba_export_all_rw on 2>/dev/null || true
+    printf 'SELinux: samba_enable_home_dirs + samba_export_all_rw on.\n'
+  fi
+}
+
+enable_services() {
+  as_root systemctl enable --now smb.service
+  as_root systemctl enable --now nmb.service 2>/dev/null \
+    || printf 'note: nmb.service not available (name discovery may be limited)\n'
+  as_root systemctl try-reload-or-restart smb.service 2>/dev/null || true
+}
+
+configure_firewall() {
+  if ! command -v firewall-cmd >/dev/null 2>&1; then
+    printf 'note: firewall-cmd not found; open TCP 139/445 manually if needed\n'
+    return 0
+  fi
+  if ! as_root firewall-cmd --state >/dev/null 2>&1; then
+    printf 'note: firewalld not running; skip samba service\n'
+    return 0
+  fi
+  as_root firewall-cmd --permanent --add-service=samba
+  as_root firewall-cmd --reload
+  printf 'firewalld: samba service allowed.\n'
+}
+
+set_smb_password() {
+  need_cmd smbpasswd
+  local user
+  user="$(target_user)"
+  printf 'Setting Samba password for %s (used by SMB clients; can differ from login).\n' "${user}"
+  as_root smbpasswd -a "${user}"
+}
+
+verify_config() {
+  if command -v testparm >/dev/null 2>&1; then
+    local max
+    max="$(as_root testparm -s 2>/dev/null | awk -F= '/usershare max shares/ { gsub(/ /,"",$2); print $2; exit }')"
+    if [[ -z "${max}" || "${max}" == "0" ]]; then
+      die "usershare max shares is 0 — sharing disabled; check smb.conf"
+    fi
+    printf 'testparm: usershare max shares = %s\n' "${max}"
+  fi
+}
+
+as_user_systemctl() {
+  local user="$1"
+  shift
+  local uid
+  uid="$(id -u "${user}")"
+  as_root runuser -u "${user}" -- env \
+    XDG_RUNTIME_DIR="/run/user/${uid}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+    systemctl --user "$@"
+}
+
+# Tie Samba ~/Public usershare to GNOME Settings → Sharing → File Sharing
+# (gnome-user-share-webdav). WebDAV + SMB Public stay in sync; smb.service
+# remains enabled system-wide so the share works whenever the toggle is on.
+install_gnome_sharing_sync() {
+  local user home public
+  user="$(target_user)"
+  home="$(getent passwd "${user}" | cut -d: -f6)"
+  [[ -n "${home}" && -d "${home}" ]] || die "home for ${user} not found"
+  public="${home}/Public"
+
+  [[ -f "${SRC_DIR}/share-on" && -f "${SRC_DIR}/share-off" ]] || die "missing share helpers in ${SRC_DIR}"
+  [[ -f "${SRC_DIR}/samba-public-share.service" ]] || die "missing user unit"
+
+  if [[ ! -d "${public}" ]]; then
+    as_root runuser -u "${user}" -- mkdir -p "${public}"
+  fi
+  as_root chmod a+rwx "${public}"
+
+  as_root install -d -m 755 "${SYNC_LIB_DST}"
+  as_root install -m 755 "${SRC_DIR}/share-on" "${SYNC_LIB_DST}/share-on"
+  as_root install -m 755 "${SRC_DIR}/share-off" "${SYNC_LIB_DST}/share-off"
+  as_root install -d -m 755 "$(dirname -- "${USER_UNIT_DST}")"
+  as_root install -m 644 "${SRC_DIR}/samba-public-share.service" "${USER_UNIT_DST}"
+
+  if [[ ! -d "/run/user/$(id -u "${user}")" ]]; then
+    printf 'warning: %s has no session bus; enable %s after login:\n' "${user}" "${USER_UNIT_NAME}" >&2
+    printf '  systemctl --user enable --now %s\n' "${USER_UNIT_NAME}" >&2
+    return 0
+  fi
+
+  as_user_systemctl "${user}" daemon-reload
+  as_user_systemctl "${user}" enable "${USER_UNIT_NAME}"
+
+  if as_user_systemctl "${user}" is-active --quiet gnome-user-share-webdav.service; then
+    if as_user_systemctl "${user}" restart "${USER_UNIT_NAME}"; then
+      printf 'GNOME File Sharing is on → Samba Public usershare active.\n'
+    else
+      printf 'warning: %s failed to start (log out/in if you were just added to %s).\n' \
+        "${USER_UNIT_NAME}" "${USERSHARES_GROUP}" >&2
+      printf 'Then: systemctl --user restart %s\n' "${USER_UNIT_NAME}" >&2
+    fi
+  else
+    as_user_systemctl "${user}" stop "${USER_UNIT_NAME}" 2>/dev/null || true
+    as_root runuser -u "${user}" -- net usershare delete Public >/dev/null 2>&1 || true
+    printf 'GNOME File Sharing is off → Samba Public usershare cleared.\n'
+    printf 'Turn on Settings → Sharing → File Sharing to publish ~/Public via WebDAV + SMB.\n'
+  fi
+}
+
+configure() {
+  need_cmd sudo
+  all_pkgs_installed || die "packages not installed yet; reboot after rpm-ostree, or run without --configure-only"
+
+  ensure_usershares_group
+  ensure_usershares_dir
+  install_dropin
+  set_home_mode
+  configure_selinux
+  enable_services
+  configure_firewall
+  verify_config
+  install_gnome_sharing_sync
+
+  printf '\nOK: Samba ready. ~/Public follows Settings → Sharing → File Sharing (WebDAV + SMB).\n'
+  printf 'List shares:  net usershare list\n'
+  printf 'Add more:     %s/share-on /path/to/folder\n' "${SYNC_LIB_DST}"
+  printf 'SMB password (optional): %s --set-password\n' "$(basename -- "$0")"
+}
+
+undo() {
+  local user
+  user="$(target_user)"
+  if [[ -d "/run/user/$(id -u "${user}")" ]]; then
+    as_user_systemctl "${user}" disable --now "${USER_UNIT_NAME}" 2>/dev/null || true
+  fi
+  if command -v net >/dev/null 2>&1; then
+    as_root runuser -u "${user}" -- net usershare delete Public >/dev/null 2>&1 || true
+  fi
+  as_root rm -f "${USER_UNIT_DST}"
+  as_root rm -rf "${SYNC_LIB_DST}"
+  as_root rm -f "${DROPIN_DST}"
+  # Leave smb.conf include line and [homes] tweak — removing blindly is risky.
+  as_root systemctl try-reload-or-restart smb.service 2>/dev/null || true
+  printf 'Removed Public sync unit, usershare, and %s.\n' "${DROPIN_DST}"
+  printf 'Services/firewall/group/RPMs left as-is.\n'
+}
+
+main() {
+  local configure_only=0 do_undo=0 do_password=0
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --configure-only)
+        configure_only=1
+        shift
+        ;;
+      --set-password)
+        do_password=1
+        shift
+        ;;
+      --undo)
+        do_undo=1
+        shift
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if ((do_undo)); then
+    undo
+    return 0
+  fi
+
+  if ((do_password)); then
+    if ! all_pkgs_installed; then
+      die "samba not installed yet; run this script (and reboot) first"
+    fi
+    set_smb_password
+    return 0
+  fi
+
+  if ((configure_only)); then
+    configure
+    return 0
+  fi
+
+  layer_packages
+
+  if all_pkgs_installed; then
+    configure
+  else
+    printf '\nPackages staged but not active in this boot yet.\n'
+  fi
+}
+
+main "$@"

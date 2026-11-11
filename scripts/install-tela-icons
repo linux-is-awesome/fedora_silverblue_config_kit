@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# Install Tela icon theme system-wide and make Flatpak apps able to see it.
+# No Fedora RPM — uses upstream: https://github.com/vinceliuice/Tela-icon-theme
+#
+# Why Refine lists Adwaita but not Tela without an override:
+#   Flatpak XDG_DATA_DIRS already includes /usr/share, so stock themes under
+#   /usr/share/icons are visible. Tela is installed under /usr/local/share/icons.
+#   Flatpak reserves the /usr tree, so --filesystem=/usr/local/... is rejected;
+#   on Silverblue /usr/local -> /var/usrlocal, and that real path can be shared.
+set -euo pipefail
+
+TELA_TAG="${TELA_TAG:-2026-07-07}"
+TELA_URL="${TELA_URL:-https://github.com/vinceliuice/Tela-icon-theme/archive/refs/tags/${TELA_TAG}.tar.gz}"
+SYSTEM_ICONS_DIR="/usr/local/share/icons"
+# "standard" installs Tela / Tela-dark / Tela-light. Override with COLOR=ubuntu etc.
+TELA_COLOR="${TELA_COLOR:-standard}"
+
+usage() {
+  cat <<'EOF'
+Usage: install-tela-icons [--color NAME] [--no-flatpak]
+                          [--apply-dark|--apply-light|--apply]
+                          [--fix-scaling]
+
+  Always installs system-wide to /usr/local/share/icons (needs sudo):
+    Tela, Tela-dark, Tela-light
+
+  Flatpak: shares the real icons path (Silverblue: /var/usrlocal/share/icons)
+  and prepends that share dir to XDG_DATA_DIRS so apps like Refine list Tela.
+  Stock Adwaita is already visible via /usr/share.
+
+  After install, patches scalable/places SVGs (64→512 intrinsic size) so
+  GTK4/Nautilus does not blur folder icons when zoomed.
+
+  --color NAME     Folder color variant (default: standard). Examples: ubuntu, nord, blue
+  --no-flatpak     Skip Flatpak overrides
+  --apply-dark     gsettings icon-theme = Tela-dark
+  --apply-light    gsettings icon-theme = Tela-light
+  --apply          gsettings icon-theme = Tela
+  --fix-scaling   Only apply the GTK4 SVG size patch to existing Tela installs
+
+Environment:
+  TELA_URL     Override source tarball URL
+  TELA_TAG     Override GitHub tag (default used in URL)
+  TELA_COLOR   Default color variant if --color not passed
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Flatpak refuses --filesystem under /usr (reserved). Resolve /usr/local to its
+# real location (on Silverblue: /var/usrlocal) so the sandbox can mount it.
+flatpak_icons_path() {
+  local real_local
+  real_local="$(readlink -f /usr/local)"
+  printf '%s\n' "${real_local}/share/icons"
+}
+
+flatpak_share_path() {
+  local icons
+  icons="$(flatpak_icons_path)"
+  printf '%s\n' "${icons%/icons}"
+}
+
+install_flatpak_access() {
+  need_cmd flatpak
+  need_cmd readlink
+
+  local icons_path share_path
+  icons_path="$(flatpak_icons_path)"
+  share_path="$(flatpak_share_path)"
+  [[ -d "${icons_path}" ]] || die "icons path not found: ${icons_path}"
+
+  printf 'Configuring Flatpak for system icons at %s ...\n' "${icons_path}"
+  local -a args=(
+    --filesystem="${icons_path}:ro"
+    --env=XDG_DATA_DIRS="${share_path}:/app/share:/usr/share:/usr/share/runtime/share:/run/host/user-share:/run/host/share"
+  )
+
+  flatpak override --user "${args[@]}"
+  if flatpak override --help 2>&1 | grep -q -- '--system'; then
+    as_root flatpak override --system "${args[@]}" \
+      || printf 'warning: could not set system Flatpak override (user override still set)\n' >&2
+  fi
+  printf 'Flatpak overrides set (user + system when permitted).\n'
+}
+
+apply_icon_theme() {
+  local name="$1"
+  need_cmd gsettings
+  gsettings set org.gnome.desktop.interface icon-theme "${name}"
+  printf 'Applied GNOME icon-theme=%s\n' "${name}"
+}
+
+# GTK 4.21+ (GtkSVG) rasterizes at the SVG intrinsic width/height, then scales
+# the bitmap. Tela places SVGs ship as 64x64, so large Nautilus zoom looks blurry.
+# Bump intrinsic size to 512 while keeping viewBox — same fix as Tela-circle #300.
+fix_gtk_svg_scaling() {
+  local theme_dir patched=0
+  printf 'Fixing scalable places SVG intrinsic size for GTK4/Nautilus...\n'
+  for theme_dir in \
+    "${SYSTEM_ICONS_DIR}/Tela" \
+    "${SYSTEM_ICONS_DIR}/Tela-dark" \
+    "${SYSTEM_ICONS_DIR}/Tela-light"; do
+    [[ -d "${theme_dir}" ]] || continue
+    # Only touch real files under scalable*/places (follow install layout).
+    while IFS= read -r -d '' svg; do
+      if grep -qE 'width="64"|height="64"' "${svg}"; then
+        as_root sed -i \
+          's/width="64"/width="512"/g; s/height="64"/height="512"/g' \
+          "${svg}"
+        patched=$((patched + 1))
+      fi
+    done < <(find "${theme_dir}" -type f -path '*/scalable*/places/*.svg' -print0 2>/dev/null)
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      as_root gtk-update-icon-cache -f "${theme_dir}" 2>/dev/null || true
+    fi
+  done
+  printf 'Patched %d scalable places SVG(s).\n' "${patched}"
+}
+
+main() {
+  local do_flatpak=1 apply="" color="${TELA_COLOR}" fix_only=0
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --color)
+        [[ "${#}" -ge 2 ]] || die "--color requires a name"
+        color="$2"
+        shift 2
+        ;;
+      --no-flatpak)
+        do_flatpak=0
+        shift
+        ;;
+      --apply-dark)
+        apply="Tela-dark"
+        shift
+        ;;
+      --apply-light)
+        apply="Tela-light"
+        shift
+        ;;
+      --apply)
+        apply="Tela"
+        shift
+        ;;
+      --fix-scaling)
+        fix_only=1
+        shift
+        ;;
+      --system|--user|--dir)
+        die "install is always system-wide ($SYSTEM_ICONS_DIR); remove $1"
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  need_cmd find
+  need_cmd sudo
+
+  if ((fix_only)); then
+    [[ -d "${SYSTEM_ICONS_DIR}/Tela-dark" || -d "${SYSTEM_ICONS_DIR}/Tela" ]] \
+      || die "no Tela install under ${SYSTEM_ICONS_DIR}; run a full install first"
+    fix_gtk_svg_scaling
+    printf '\nOK: GTK4 folder scaling fix applied. Restart Files (nautilus -q) if icons still look soft.\n'
+    return 0
+  fi
+
+  need_cmd curl
+  need_cmd tar
+  need_cmd mktemp
+
+  local tmp
+  tmp="$(mktemp -d)"
+  trap "rm -rf $(printf '%q' "${tmp}")" EXIT
+
+  printf 'Downloading %s\n' "${TELA_URL}"
+  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/tela.tar.gz" "${TELA_URL}"
+  mkdir -p "${tmp}/extract"
+  tar -xzf "${tmp}/tela.tar.gz" -C "${tmp}/extract"
+
+  local src
+  src="$(find "${tmp}/extract" -maxdepth 1 -type d -name 'Tela-icon-theme-*' | head -n 1)"
+  [[ -n "${src}" && -x "${src}/install.sh" ]] || die "Tela install.sh not found in archive"
+
+  as_root mkdir -p "${SYSTEM_ICONS_DIR}"
+  printf 'Installing Tela (%s) -> %s\n' "${color}" "${SYSTEM_ICONS_DIR}"
+  as_root bash "${src}/install.sh" -d "${SYSTEM_ICONS_DIR}" "${color}"
+  as_root chmod -R a+rX \
+    "${SYSTEM_ICONS_DIR}/Tela" \
+    "${SYSTEM_ICONS_DIR}/Tela-dark" \
+    "${SYSTEM_ICONS_DIR}/Tela-light" 2>/dev/null || true
+
+  fix_gtk_svg_scaling
+
+  if ((do_flatpak)); then
+    install_flatpak_access
+  else
+    printf 'Skipped Flatpak override (--no-flatpak).\n'
+  fi
+
+  if [[ -n "${apply}" ]]; then
+    apply_icon_theme "${apply}"
+  else
+    printf '\nIcon themes installed. Activate, e.g.:\n'
+    printf '  gsettings set org.gnome.desktop.interface icon-theme Tela-dark\n'
+    printf 'Or re-run with --apply-dark / --apply-light / --apply.\n'
+  fi
+
+  printf '\nOK: Tela icons installed under %s\n' "${SYSTEM_ICONS_DIR}"
+  printf 'Note: no Fedora RPM; re-run this script to update from GitHub.\n'
+}
+
+main "$@"

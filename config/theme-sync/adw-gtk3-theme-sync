@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Keep gtk-theme light/dark variant in sync with color-scheme (adw-gtk3 ↔ adw-gtk3-dark).
+# Works for any Foo / Foo-dark pair present in system theme dirs.
+set -euo pipefail
+
+LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${LIB_DIR}/common.sh"
+
+set_theme_variant() {
+  local user="$1" theme="$2" current="$3"
+  [[ -z "${theme}" || "${theme}" == "${current}" ]] && return 0
+  theme_exists gtk-theme "${theme}" || return 0
+  as_user "${user}" gsettings set org.gnome.desktop.interface gtk-theme "${theme}" 2>/dev/null || true
+}
+
+adjust_theme_for_colorscheme() {
+  local user="$1" color_scheme gtk_theme
+
+  color_scheme="$(get_user_gsettings "${user}" color-scheme)" || return 0
+  gtk_theme="$(get_user_gsettings "${user}" gtk-theme)" || return 0
+
+  color_scheme="$(unquote_gvariant "${color_scheme}")"
+  gtk_theme="$(unquote_gvariant "${gtk_theme}")"
+
+  case "${color_scheme}" in
+    prefer-dark)
+      set_theme_variant "${user}" "${gtk_theme}-dark" "${gtk_theme}"
+      ;;
+    default|prefer-light)
+      set_theme_variant "${user}" "${gtk_theme%-dark}" "${gtk_theme}"
+      ;;
+  esac
+}
+
+bootstrap_active_admin_user
+adjust_theme_for_colorscheme "${active_user}"
+
+prev_color_scheme=""
+as_user "${active_user}" stdbuf -oL gdbus monitor --session \
+  --dest ca.desrt.dconf --object-path /ca/desrt/dconf/Writer/user 2>/dev/null \
+| while read -r line; do
+  if [[ "${line}" == *"/org/gnome/desktop/interface/color-scheme"* ]]; then
+    current_color_scheme="$(get_user_gsettings "${active_user}" color-scheme || true)"
+    current_color_scheme="$(unquote_gvariant "${current_color_scheme}")"
+    if [[ -n "${current_color_scheme}" && "${current_color_scheme}" != "${prev_color_scheme}" ]]; then
+      adjust_theme_for_colorscheme "${active_user}"
+      prev_color_scheme="${current_color_scheme}"
+    fi
+  fi
+done

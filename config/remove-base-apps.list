@@ -1,0 +1,16 @@
+# Base-image packages to remove with rpm-ostree override remove.
+# Lines starting with # and blank lines are ignored.
+# Names must match RPM package names (rpm -q <name>).
+
+# Firefox (base browser + langpacks; remove together)
+firefox
+firefox-langpacks
+
+# GNOME Help
+yelp
+
+# GNOME Tour
+gnome-tour
+
+# System Monitor
+gnome-system-monitor

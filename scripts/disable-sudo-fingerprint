@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Disable fingerprint auth for sudo / polkit elevation; keep it for login.
+#
+# authselect's with-fingerprint puts pam_fprintd in system-auth. sudo and
+# polkit both do "auth include system-auth". This script only retargets that
+# auth line to a tiny password-only fragment — other PAM lines stay untouched.
+set -euo pipefail
+
+SUDO_PAM="${SUDO_PAM:-/etc/pam.d/sudo}"
+POLKIT_STOCK="${POLKIT_STOCK:-/usr/lib/pam.d/polkit-1}"
+POLKIT_PAM="${POLKIT_PAM:-/etc/pam.d/polkit-1}"
+# Shared auth stack used by the patched auth include lines.
+NOFP_AUTH="${NOFP_AUTH:-/etc/pam.d/nofingerprint-auth}"
+MARKER="# fedora_silverblue_config: no fingerprint for elevation"
+
+usage() {
+  cat <<'EOF'
+Usage: disable-sudo-fingerprint [--undo]
+
+  Password-only for sudo / sudo -i and polkit / pkexec.
+  Login fingerprint stays (authselect with-fingerprint).
+
+  Changes:
+    - adds /etc/pam.d/nofingerprint-auth (password-only auth stack)
+    - in /etc/pam.d/sudo: auth include system-auth → nofingerprint-auth
+    - /etc/pam.d/polkit-1: same one-line retarget (stock lives under /usr/lib)
+
+  --undo   Revert those auth includes; remove the fragment + polkit override.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_nofp_fragment() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"${tmp}" <<EOF
+#%PAM-1.0
+# ${MARKER}
+# Password-only auth (no pam_fprintd). Used by sudo / polkit overrides.
+auth       required	pam_env.so
+auth       required	pam_faildelay.so delay=2000000
+auth       sufficient	pam_unix.so nullok
+auth       required	pam_deny.so
+EOF
+  as_root install -m 644 "${tmp}" "${NOFP_AUTH}"
+  rm -f "${tmp}"
+  printf 'Installed %s\n' "${NOFP_AUTH}"
+}
+
+# Rewrite only auth "include system-auth" → include nofingerprint-auth.
+# Leaves account/password/session and any other lines alone.
+retarget_auth_include() {
+  local src="$1" dst="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  [[ -f "${src}" ]] || die "missing PAM file: ${src}"
+
+  if grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+nofingerprint-auth[[:space:]]*$' "${src}" \
+    || grep -qF "${MARKER}" "${src}"; then
+    printf 'Already patched: %s\n' "${dst}"
+    rm -f "${tmp}"
+    return 0
+  fi
+
+  grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+system-auth[[:space:]]*$' "${src}" \
+    || die "no 'auth include system-auth' line in ${src}"
+
+  # shellcheck disable=SC2016
+  awk -v marker="${MARKER}" '
+    /^[[:space:]]*auth[[:space:]]+include[[:space:]]+system-auth[[:space:]]*$/ {
+      print "auth       include      nofingerprint-auth  " marker
+      changed=1
+      next
+    }
+    { print }
+    END { if (!changed) exit 2 }
+  ' "${src}" >"${tmp}" || die "failed to patch ${src}"
+
+  as_root install -m 644 "${tmp}" "${dst}"
+  rm -f "${tmp}"
+  printf 'Retargeted auth include in %s\n' "${dst}"
+}
+
+restore_auth_include() {
+  local src="$1" dst="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  [[ -f "${src}" ]] || { rm -f "${tmp}"; return 0; }
+
+  if ! grep -qE 'nofingerprint-auth' "${src}"; then
+    printf 'No nofingerprint-auth include in %s\n' "${src}"
+    rm -f "${tmp}"
+    return 0
+  fi
+
+  awk '
+    /^[[:space:]]*auth[[:space:]]+include[[:space:]]+nofingerprint-auth([[:space:]]|$)/ {
+      print "auth       include      system-auth"
+      next
+    }
+    { print }
+  ' "${src}" >"${tmp}"
+
+  as_root install -m 644 "${tmp}" "${dst}"
+  rm -f "${tmp}"
+  printf 'Restored auth include in %s\n' "${dst}"
+}
+
+# Older version of this script replaced the whole sudo file. Put stock back
+# first so we can do a one-line retarget instead.
+migrate_legacy_sudo_override() {
+  local bak="/etc/pam.d/sudo.fedora-silverblue-config.bak"
+  if [[ -f "${bak}" ]]; then
+    as_root mv -f "${bak}" "${SUDO_PAM}"
+    printf 'Restored stock %s from legacy backup\n' "${SUDO_PAM}"
+    return 0
+  fi
+  if [[ -f "${SUDO_PAM}" ]] \
+    && grep -q 'disable-sudo-fingerprint' "${SUDO_PAM}" \
+    && ! grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+(system-auth|nofingerprint-auth)' "${SUDO_PAM}"; then
+    local tmp
+    tmp="$(mktemp)"
+    cat >"${tmp}" <<'EOF'
+#%PAM-1.0
+auth       include      system-auth
+account    include      system-auth
+password   include      system-auth
+session    optional     pam_keyinit.so revoke
+session    required     pam_limits.so
+session    include      system-auth
+EOF
+    as_root install -m 644 "${tmp}" "${SUDO_PAM}"
+    rm -f "${tmp}"
+    printf 'Replaced legacy full sudo PAM override with stock template\n'
+  fi
+}
+
+apply() {
+  migrate_legacy_sudo_override
+  install_nofp_fragment
+  retarget_auth_include "${SUDO_PAM}" "${SUDO_PAM}"
+
+  # polkit stock is under /usr/lib; /etc/pam.d/polkit-1 overrides it.
+  # If a legacy full override exists, start from stock then retarget one line.
+  if [[ -f "${POLKIT_PAM}" ]] \
+    && grep -q 'disable-sudo-fingerprint' "${POLKIT_PAM}" \
+    && ! grep -qE '^[[:space:]]*auth[[:space:]]+include[[:space:]]+(system-auth|nofingerprint-auth)' "${POLKIT_PAM}"; then
+    as_root rm -f "${POLKIT_PAM}"
+  fi
+  if [[ -f "${POLKIT_PAM}" ]]; then
+    retarget_auth_include "${POLKIT_PAM}" "${POLKIT_PAM}"
+  else
+    retarget_auth_include "${POLKIT_STOCK}" "${POLKIT_PAM}"
+  fi
+
+  printf '\nFingerprint disabled for sudo and polkit. Login fingerprint unchanged.\n'
+  printf 'Test: sudo -k && sudo true\n'
+}
+
+undo() {
+  if [[ -f "${SUDO_PAM}" ]]; then
+    restore_auth_include "${SUDO_PAM}" "${SUDO_PAM}"
+  fi
+
+  if [[ -f "${POLKIT_PAM}" ]]; then
+    # Override only existed for our one-line change — remove it entirely.
+    as_root rm -f "${POLKIT_PAM}"
+    printf 'Removed %s (stock %s applies again)\n' "${POLKIT_PAM}" "${POLKIT_STOCK}"
+  else
+    printf 'No polkit override at %s\n' "${POLKIT_PAM}"
+  fi
+
+  if [[ -f "${NOFP_AUTH}" ]]; then
+    as_root rm -f "${NOFP_AUTH}"
+    printf 'Removed %s\n' "${NOFP_AUTH}"
+  fi
+}
+
+main() {
+  local do_undo=0
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --undo)
+      do_undo=1
+      shift
+      ;;
+    "")
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  if ((do_undo)); then
+    undo
+  else
+    apply
+  fi
+}
+
+main "$@"

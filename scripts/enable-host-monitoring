@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Host tooling + permissions for system monitors (Mission Center, similar apps).
+#
+# Layers nethogs / smartmontools / lm_sensors, opens RAPL for CPU power (W),
+# and grants nethogs capabilities for per-process network stats.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../config/host-monitoring"
+UDEV_DST="${UDEV_DST:-/etc/udev/rules.d/99-rapl-readable.rules}"
+CAPS_UNIT_DST="${CAPS_UNIT_DST:-/etc/systemd/system/nethogs-caps.service}"
+CAPS_UNIT_NAME="nethogs-caps.service"
+
+PKGS=(
+  nethogs
+  smartmontools
+  lm_sensors
+)
+
+usage() {
+  cat <<'EOF'
+Usage: enable-host-monitoring [--configure-only] [--undo]
+
+  Configures the host for system monitoring tools (not app-specific):
+
+    - CPU power (W)          → readable RAPL energy_uj (udev + chmod)
+    - Per-process network    → nethogs + capabilities (boot oneshot)
+    - Disk SMART             → smartmontools (smartctl)
+    - Fans / sensors         → lm_sensors (+ sensors-detect --auto)
+
+  Layering needs a reboot. After reboot, re-run with --configure-only
+  (or run again — configure runs automatically when packages are live).
+
+  --configure-only   Skip rpm-ostree; only udev, caps, sensors
+  --undo             Remove udev rule + caps oneshot (keeps layered RPMs)
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+package_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+all_pkgs_installed() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || return 1
+  done
+  return 0
+}
+
+missing_pkgs() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || printf '%s\n' "${p}"
+  done
+}
+
+layer_packages() {
+  need_cmd rpm-ostree
+  need_cmd rpm
+  need_cmd sudo
+
+  if all_pkgs_installed; then
+    printf 'Host packages already installed: %s\n' "${PKGS[*]}"
+    return 0
+  fi
+
+  local -a need=()
+  mapfile -t need < <(missing_pkgs)
+  printf 'Layering via rpm-ostree:\n'
+  local p
+  for p in "${need[@]}"; do
+    printf '  %s\n' "${p}"
+  done
+  as_root rpm-ostree install "${need[@]}"
+  printf '\nQueued. Reboot, then re-run: %s --configure-only\n' "$(basename -- "$0")"
+}
+
+install_rapl_udev() {
+  local src="${SRC_DIR}/99-rapl-readable.rules"
+  [[ -f "${src}" ]] || die "missing ${src}"
+
+  as_root install -d -m 755 "$(dirname -- "${UDEV_DST}")"
+  as_root install -m 644 "${src}" "${UDEV_DST}"
+  as_root udevadm control --reload 2>/dev/null || true
+  as_root udevadm trigger --subsystem-match=powercap 2>/dev/null || true
+
+  as_root bash -c 'chmod a+r /sys/class/powercap/intel-rapl*/energy_uj 2>/dev/null || true'
+  as_root bash -c 'chmod a+r /sys/class/powercap/intel-rapl*/*/energy_uj 2>/dev/null || true'
+
+  local sample="/sys/class/powercap/intel-rapl:0/energy_uj"
+  if [[ -r "${sample}" ]]; then
+    printf 'RAPL energy_uj is readable (CPU power OK).\n'
+  elif [[ -e "${sample}" ]]; then
+    printf 'warning: %s still not readable; reboot may be needed for udev\n' "${sample}" >&2
+  else
+    printf 'note: no intel-rapl sysfs nodes (CPU power unsupported here)\n'
+  fi
+}
+
+install_nethogs_caps() {
+  local src="${SRC_DIR}/nethogs-caps.service"
+  [[ -f "${src}" ]] || die "missing ${src}"
+
+  if ! command -v nethogs >/dev/null 2>&1 && [[ ! -x /usr/sbin/nethogs ]]; then
+    printf 'warning: nethogs not on PATH yet (reboot after layering?)\n' >&2
+  fi
+
+  as_root install -d -m 755 "$(dirname -- "${CAPS_UNIT_DST}")"
+  as_root install -m 644 "${src}" "${CAPS_UNIT_DST}"
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "${CAPS_UNIT_NAME}"
+
+  local nethogs_bin=""
+  nethogs_bin="$(command -v nethogs 2>/dev/null || true)"
+  [[ -z "${nethogs_bin}" && -x /usr/sbin/nethogs ]] && nethogs_bin=/usr/sbin/nethogs
+  if [[ -n "${nethogs_bin}" ]] && command -v getcap >/dev/null 2>&1; then
+    printf 'nethogs caps: %s\n' "$(getcap "${nethogs_bin}" 2>/dev/null || echo '(none)')"
+  fi
+}
+
+configure_sensors() {
+  if ! command -v sensors-detect >/dev/null 2>&1; then
+    printf 'lm_sensors not active yet; skip sensors-detect\n'
+    return 0
+  fi
+  printf 'Running sensors-detect --auto...\n'
+  as_root sensors-detect --auto >/dev/null 2>&1 || true
+  if command -v sensors >/dev/null 2>&1; then
+    printf 'sensors OK (%d hwmon lines)\n' "$(sensors 2>/dev/null | wc -l)"
+  fi
+}
+
+configure() {
+  need_cmd sudo
+  install_rapl_udev
+  install_nethogs_caps
+  configure_sensors
+
+  if command -v smartctl >/dev/null 2>&1; then
+    printf 'smartctl present (disk SMART).\n'
+  else
+    printf 'warning: smartctl missing — reboot after layering smartmontools\n' >&2
+  fi
+
+  printf '\nOK: host monitoring extras configured.\n'
+  printf 'Useful for Mission Center and similar tools (CPU power, SMART, sensors, nethogs).\n'
+}
+
+undo() {
+  as_root systemctl disable --now "${CAPS_UNIT_NAME}" 2>/dev/null || true
+  as_root rm -f "${CAPS_UNIT_DST}" "${UDEV_DST}"
+  as_root systemctl daemon-reload 2>/dev/null || true
+  as_root udevadm control --reload 2>/dev/null || true
+  printf 'Removed RAPL udev rule and nethogs caps oneshot.\n'
+  printf 'Layered RPMs (%s) left installed; remove with rpm-ostree uninstall if desired.\n' "${PKGS[*]}"
+}
+
+main() {
+  local configure_only=0 do_undo=0
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --configure-only)
+        configure_only=1
+        shift
+        ;;
+      --undo)
+        do_undo=1
+        shift
+        ;;
+      --no-flatpak)
+        # Kept so an old invocation does not hard-fail; Flatpak is never installed.
+        shift
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if ((do_undo)); then
+    undo
+    return 0
+  fi
+
+  if ((configure_only)); then
+    configure
+    return 0
+  fi
+
+  layer_packages
+
+  if all_pkgs_installed; then
+    configure
+  else
+    printf '\nPackages staged but not active in this boot yet.\n'
+  fi
+}
+
+main "$@"

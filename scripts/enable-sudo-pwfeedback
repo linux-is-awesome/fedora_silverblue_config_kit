@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Show asterisks when typing a sudo password in the terminal (Defaults pwfeedback).
+set -euo pipefail
+
+SUDOERS_DROPIN="${SUDOERS_DROPIN:-/etc/sudoers.d/pwfeedback}"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-sudo-pwfeedback [--undo]
+
+  Installs a sudoers drop-in so sudo password prompts echo '*' for each
+  character typed (pwfeedback). Only affects sudo, not SSH/passwd/etc.
+
+  --undo   Remove the drop-in and restore silent password entry.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_dropin() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"${tmp}" <<'EOF'
+# Installed by fedora_silverblue_config/scripts/enable-sudo-pwfeedback
+# Echo '*' for each character typed at the sudo password prompt.
+Defaults pwfeedback
+EOF
+
+  # visudo -c rejects bad syntax before we replace a live drop-in.
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "${tmp}" >/dev/null || {
+      rm -f "${tmp}"
+      die "generated sudoers fragment failed visudo -c"
+    }
+  fi
+
+  as_root install -d -m 755 "$(dirname -- "${SUDOERS_DROPIN}")"
+  as_root install -m 440 "${tmp}" "${SUDOERS_DROPIN}"
+  rm -f "${tmp}"
+
+  if command -v visudo >/dev/null 2>&1; then
+    as_root visudo -cf "${SUDOERS_DROPIN}" >/dev/null \
+      || die "installed ${SUDOERS_DROPIN} but visudo -c failed — remove it and retry"
+  fi
+
+  printf 'Installed %s\n' "${SUDOERS_DROPIN}"
+  printf 'sudo password prompts will show asterisks. Try: sudo -k && sudo true\n'
+}
+
+remove_dropin() {
+  if [[ -f "${SUDOERS_DROPIN}" ]]; then
+    as_root rm -f "${SUDOERS_DROPIN}"
+    printf 'Removed %s\n' "${SUDOERS_DROPIN}"
+  else
+    printf 'No drop-in at %s\n' "${SUDOERS_DROPIN}"
+  fi
+}
+
+main() {
+  local undo=0
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --undo)
+      undo=1
+      shift
+      ;;
+    "")
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  if ((undo)); then
+    remove_dropin
+  else
+    install_dropin
+  fi
+}
+
+main "$@"

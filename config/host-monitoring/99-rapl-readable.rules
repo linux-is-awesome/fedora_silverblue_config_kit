@@ -1,0 +1,4 @@
+# Allow non-root read of RAPL energy counters (CPU package power in watts).
+# Used by system monitors (Mission Center, nvtop, etc.) without root.
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", RUN+="/bin/chmod a+r /sys/class/powercap/%k/energy_uj"
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl", RUN+="/bin/chmod a+r /sys/class/powercap/%k/energy_uj"

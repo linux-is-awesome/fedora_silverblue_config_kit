@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync GNOME theme/icons to GDM and system GTK settings
+After=accounts-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/theme-sync/gdm-theme-sync
+Restart=on-failure
+RestartSec=2

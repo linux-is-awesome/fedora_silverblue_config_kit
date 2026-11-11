@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Apply Ubuntu look-and-feel for fonts system-wide:
+#   - fontconfig: sans → Ubuntu; monospace → DejaVu Sans Mono (Ubuntu 60-latin-like)
+#   - GNOME interface / document / monospace / titlebar fonts (Ubuntu Sans Mono via gsettings)
+#   - grayscale antialiasing + slight hinting
+#
+# GDM greeter: use scripts/sync-gdm-settings (monitors + desktop settings).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONF_SRC="${SCRIPT_DIR}/../config/fontconfig/99-ubuntu-look.conf"
+CONF_DST="/etc/fonts/conf.d/99-ubuntu-look.conf"
+CONF_NAME="99-ubuntu-look.conf"
+
+# Ubuntu desktop-ish defaults.
+UI_FONT="${UI_FONT:-Ubuntu 11}"
+DOCUMENT_FONT="${DOCUMENT_FONT:-Ubuntu 11}"
+MONO_FONT="${MONO_FONT:-Ubuntu Sans Mono 12}"
+TITLE_FONT="${TITLE_FONT:-Ubuntu Bold 11}"
+
+usage() {
+  cat <<'EOF'
+Usage: configure-ubuntu-fonts
+
+  Installs fontconfig rules and configures GNOME session fonts
+  for an Ubuntu-like look.
+
+  Also copies the fontconfig drop-in to:
+    ~/.config/fontconfig/conf.d/
+    ~/.containers/work_container/home/.config/fontconfig/conf.d/
+      (when that work-container home exists)
+
+  For the login screen (GDM), including monitors: run sync-gdm-settings.
+
+Requires Ubuntu fonts already installed (see install-ubuntu-fonts).
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+ensure_ubuntu_fonts_present() {
+  fc-list "Ubuntu" file >/dev/null 2>&1 || die "Ubuntu font not found; run install-ubuntu-fonts first"
+  fc-list "Ubuntu Sans Mono" file >/dev/null 2>&1 || die "Ubuntu Sans Mono not found; run install-ubuntu-fonts first"
+  fc-list "DejaVu Sans Mono" file >/dev/null 2>&1 || die "DejaVu Sans Mono not found; run install-dejavu-fonts first"
+}
+
+install_user_fontconfig() {
+  # install_user_fontconfig HOME_DIR
+  # User-level drop-in (no root). Cursor/VS Code in the work container use APP_HOME,
+  # which is not the same tree as host ~/.config unless we sync it explicitly.
+  local home_dir="$1"
+  local dest_dir dest
+  [[ -n "${home_dir}" && -d "${home_dir}" ]] || return 0
+  dest_dir="${home_dir}/.config/fontconfig/conf.d"
+  dest="${dest_dir}/${CONF_NAME}"
+  mkdir -p "${dest_dir}"
+  install -m 644 "${CONF_SRC}" "${dest}"
+  printf 'Installed %s\n' "${dest}"
+}
+
+work_container_home() {
+  # Prefer explicit override, then the usual Silverblue/toolbox layout under $HOME.
+  local candidate="${WORK_CONTAINER_HOME:-${HOME}/.containers/work_container/home}"
+  if [[ -d "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+  fi
+}
+
+install_fontconfig() {
+  [[ -f "${CONF_SRC}" ]] || die "missing config: ${CONF_SRC}"
+  as_root install -d -m 755 /etc/fonts/conf.d
+  as_root install -m 644 "${CONF_SRC}" "${CONF_DST}"
+  printf 'Installed %s\n' "${CONF_DST}"
+
+  install_user_fontconfig "${HOME}"
+  local container_home
+  container_home="$(work_container_home || true)"
+  if [[ -n "${container_home}" && "${container_home}" != "${HOME}" ]]; then
+    install_user_fontconfig "${container_home}"
+  fi
+
+  as_root fc-cache -f >/dev/null || fc-cache -f >/dev/null || true
+}
+
+gset() {
+  # gset SCHEMA KEY VALUE
+  gsettings set "$1" "$2" "$3"
+}
+
+configure_gnome_session() {
+  need_cmd gsettings
+
+  # Manual rendering so antialiasing/hinting keys are honored (GNOME 47+).
+  if gsettings range org.gnome.desktop.interface font-rendering >/dev/null 2>&1; then
+    gset org.gnome.desktop.interface font-rendering manual
+  fi
+
+  gset org.gnome.desktop.interface font-name "${UI_FONT}"
+  gset org.gnome.desktop.interface document-font-name "${DOCUMENT_FONT}"
+  gset org.gnome.desktop.interface monospace-font-name "${MONO_FONT}"
+  gset org.gnome.desktop.interface font-antialiasing grayscale
+  gset org.gnome.desktop.interface font-hinting slight
+  gset org.gnome.desktop.wm.preferences titlebar-font "${TITLE_FONT}"
+
+  printf 'Configured GNOME fonts for user %s\n' "${USER}"
+}
+
+configure_gtk_settings() {
+  # Ensure GTK apps pick Ubuntu + grayscale AA via settings.ini.
+  local gtk3="${HOME}/.config/gtk-3.0/settings.ini"
+  local gtk4="${HOME}/.config/gtk-4.0/settings.ini"
+  mkdir -p "$(dirname -- "${gtk3}")" "$(dirname -- "${gtk4}")"
+
+  write_gtk_ini() {
+    local path="$1"
+    if [[ -f "${path}" ]] && grep -q 'gtk-font-name=' "${path}"; then
+      sed -i \
+        -e "s|^gtk-font-name=.*|gtk-font-name=${UI_FONT}|" \
+        -e "s|^gtk-xft-antialias=.*|gtk-xft-antialias=1|" \
+        -e "s|^gtk-xft-hinting=.*|gtk-xft-hinting=1|" \
+        -e "s|^gtk-xft-hintstyle=.*|gtk-xft-hintstyle=hintslight|" \
+        -e "s|^gtk-xft-rgba=.*|gtk-xft-rgba=none|" \
+        "${path}"
+      grep -q '^gtk-xft-antialias=' "${path}" || sed -i '/^\[Settings\]/a gtk-xft-antialias=1' "${path}"
+      grep -q '^gtk-xft-hinting=' "${path}" || sed -i '/^\[Settings\]/a gtk-xft-hinting=1' "${path}"
+      grep -q '^gtk-xft-hintstyle=' "${path}" || sed -i '/^\[Settings\]/a gtk-xft-hintstyle=hintslight' "${path}"
+      grep -q '^gtk-xft-rgba=' "${path}" || sed -i '/^\[Settings\]/a gtk-xft-rgba=none' "${path}"
+    else
+      cat >"${path}" <<EOF
+[Settings]
+gtk-font-name=${UI_FONT}
+gtk-xft-antialias=1
+gtk-xft-hinting=1
+gtk-xft-hintstyle=hintslight
+gtk-xft-rgba=none
+EOF
+    fi
+  }
+
+  write_gtk_ini "${gtk3}"
+  write_gtk_ini "${gtk4}"
+  printf 'Updated GTK settings.ini (gtk-3.0 / gtk-4.0).\n'
+}
+
+print_status() {
+  printf '\nEffective settings:\n'
+  printf '  interface : %s\n' "$(gsettings get org.gnome.desktop.interface font-name)"
+  printf '  document  : %s\n' "$(gsettings get org.gnome.desktop.interface document-font-name)"
+  printf '  monospace : %s\n' "$(gsettings get org.gnome.desktop.interface monospace-font-name)"
+  printf '  titlebar  : %s\n' "$(gsettings get org.gnome.desktop.wm.preferences titlebar-font)"
+  printf '  AA        : %s\n' "$(gsettings get org.gnome.desktop.interface font-antialiasing)"
+  printf '  hinting   : %s\n' "$(gsettings get org.gnome.desktop.interface font-hinting)"
+  printf '  fc sans   : %s\n' "$(fc-match sans-serif)"
+  printf '  fc mono   : %s\n' "$(fc-match monospace)"
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  need_cmd fc-list
+  need_cmd fc-cache
+  need_cmd fc-match
+  need_cmd gsettings
+  need_cmd install
+
+  ensure_ubuntu_fonts_present
+  install_fontconfig
+  configure_gnome_session
+  configure_gtk_settings
+  print_status
+
+  printf '\nOK: Ubuntu font look applied to this GNOME session.\n'
+  printf 'Sync login screen with: scripts/sync-gdm-settings\n'
+}
+
+main "$@"

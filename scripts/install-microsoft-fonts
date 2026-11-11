@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Install Microsoft Core Fonts for the Web system-wide (visible to GDM).
+# Downloads the official redistributable .exe cabinets and extracts .ttf files.
+# By running this you accept the Microsoft Core Fonts EULA presented by those installers.
+#
+# No rpm-ostree layering required — fonts go under /usr/local/share/fonts.
+set -euo pipefail
+
+COREFONTS_BASE_URL="${COREFONTS_BASE_URL:-https://downloads.sourceforge.net/corefonts}"
+DEFAULT_SYSTEM_DIR="/usr/local/share/fonts/microsoft"
+
+# Classic "Core fonts for the Web" packages (self-extracting CAB EXEs).
+COREFONT_PACKAGES=(
+  andale32
+  arial32
+  arialb32
+  comic32
+  courie32
+  georgi32
+  impact32
+  times32
+  trebuc32
+  verdan32
+  webdin32
+)
+
+usage() {
+  cat <<'EOF'
+Usage: install-microsoft-fonts [--system|--user] [--dir DIR]
+
+  Installs Microsoft Core Fonts (Arial, Times New Roman, Courier New, Verdana,
+  Georgia, Trebuchet, Comic Sans, Impact, Andale Mono, Webdings, …).
+
+  --system   Install to /usr/local/share/fonts/microsoft (default; needs sudo; GDM can use)
+  --user     Install to ~/.local/share/fonts/microsoft (current user only; GDM cannot use)
+  --dir DIR  Install to DIR instead (uses sudo if DIR is not writable)
+
+Environment:
+  COREFONTS_BASE_URL   Mirror base URL for the *.exe packages
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+USE_SUDO=0
+
+as_root() {
+  if ((USE_SUDO)); then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+download() {
+  local url="$1" dest="$2"
+  printf '  %s\n' "$(basename -- "${dest}")"
+  curl -fL --retry 3 --retry-delay 1 -o "${dest}" "${url}"
+}
+
+extract_fonts_from_exe() {
+  local exe_path="$1" out_dir="$2"
+  # 7-Zip can open these self-extracting CAB installers and pull out TTF files.
+  7z e -y -o"${out_dir}" "${exe_path}" '*.ttf' '*.TTF' -r >/dev/null
+}
+
+main() {
+  local dest="" mode="system"
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --user)
+        mode="user"
+        shift
+        ;;
+      --system)
+        mode="system"
+        shift
+        ;;
+      --dir)
+        [[ "${#}" -ge 2 ]] || die "--dir requires a path"
+        dest="$2"
+        mode="custom"
+        shift 2
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  need_cmd curl
+  need_cmd 7z
+  need_cmd fc-cache
+  need_cmd find
+  need_cmd mktemp
+
+  case "${mode}" in
+    user)
+      dest="${HOME}/.local/share/fonts/microsoft"
+      ;;
+    system)
+      dest="${DEFAULT_SYSTEM_DIR}"
+      ;;
+    custom)
+      [[ -n "${dest}" ]] || die "empty --dir"
+      ;;
+  esac
+
+  local parent
+  parent="$(dirname -- "${dest}")"
+  if [[ ! -d "${dest}" ]]; then
+    if [[ -w "${parent}" ]] || mkdir -p "${dest}" 2>/dev/null; then
+      :
+    else
+      USE_SUDO=1
+    fi
+  elif [[ ! -w "${dest}" ]]; then
+    USE_SUDO=1
+  fi
+
+  if ((USE_SUDO)); then
+    need_cmd sudo
+  fi
+
+  as_root mkdir -p "${dest}"
+
+  # Path must be baked into the trap: a local `tmp` is unbound when EXIT runs.
+  local tmp stage
+  tmp="$(mktemp -d)"
+  stage="${tmp}/fonts"
+  mkdir -p "${stage}"
+  trap "rm -rf $(printf '%q' "${tmp}")" EXIT
+
+  printf 'Downloading Microsoft core font packages...\n'
+  local pkg
+  for pkg in "${COREFONT_PACKAGES[@]}"; do
+    download "${COREFONTS_BASE_URL}/${pkg}.exe" "${tmp}/${pkg}.exe"
+    extract_fonts_from_exe "${tmp}/${pkg}.exe" "${stage}"
+  done
+
+  local -a fonts=()
+  mapfile -t fonts < <(find "${stage}" -type f \( -iname '*.ttf' \) | sort)
+  ((${#fonts[@]} > 0)) || die "no TTF files extracted"
+
+  # Replace previous install for idempotent updates.
+  as_root find "${dest}" -maxdepth 1 -type f -iname '*.ttf' -delete
+
+  local f
+  for f in "${fonts[@]}"; do
+    as_root cp -f -- "${f}" "${dest}/"
+  done
+  # Archives may preserve mode 600; fonts must be world-readable for fontconfig/GDM.
+  as_root find "${dest}" -maxdepth 1 -type f -iname '*.ttf' -exec chmod 644 {} +
+
+  printf 'Refreshing font cache...\n'
+  as_root fc-cache -f "${dest}" >/dev/null
+
+  printf '\nOK: Microsoft fonts installed under %s (%d files)\n' "${dest}" "${#fonts[@]}"
+  if [[ "${dest}" == "${DEFAULT_SYSTEM_DIR}" || "${mode}" == "system" ]]; then
+    printf 'System-wide install: GDM and all users can use these fonts.\n'
+  fi
+  printf 'No rpm-ostree step needed. GDM may need a restart/reboot to pick them up.\n'
+  printf 'Families visible to fontconfig (sample):\n'
+  # Avoid SIGPIPE/141 under pipefail when head closes the pipe early.
+  local -a _font_sample=()
+  mapfile -t _font_sample < <(fc-list "${dest}" 2>/dev/null | sort -u | head -n 40 || true)
+  if ((${#_font_sample[@]} == 0)); then
+    mapfile -t _font_sample < <(
+      fc-list \
+        | grep -iE 'arial|times new roman|courier new|verdana|georgia|trebuchet|comic sans|impact|andale|webdings' \
+        | sort -u | head -n 40 || true
+    )
+  fi
+  local _line
+  for _line in "${_font_sample[@]:-}"; do
+    printf '  %s\n' "${_line}"
+  done
+}
+
+main "$@"

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Live-sync the active admin user's GNOME look into GDM + system GTK settings.ini.
+# Port of custom_distro gnome-theme-watchdog for Silverblue (+ appearance-key filter).
+set -euo pipefail
+
+LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${LIB_DIR}/common.sh"
+
+GDM_DCONF_PATH="${GDM_DCONF_PATH:-/etc/dconf/db/gdm.d/50-gdm-theme-sync}"
+GTK3_INI_PATH="${GTK3_INI_PATH:-${STATE_DIR}/gtk-3.0/settings.ini}"
+GTK4_INI_PATH="${GTK4_INI_PATH:-${STATE_DIR}/gtk-4.0/settings.ini}"
+DCONF_IDLE_SECS="${DCONF_IDLE_SECS:-1}"
+GDM_DCONF_DB="${GDM_DCONF_DB:-/etc/dconf/db/gdm}"
+GDM_DCONF_D="${GDM_DCONF_D:-/etc/dconf/db/gdm.d}"
+DCONF_REQ="${STATE_DIR}/.dconf-update-req"
+DCONF_PIDFILE="${STATE_DIR}/.dconf-updater.pid"
+
+update_symlinks() {
+  STATE_DIR="${STATE_DIR}" "${LIB_DIR}/update-gtk-settings-symlinks"
+}
+
+# Write drop-ins immediately; coalesce compile of the GDM db only (not full dconf update).
+schedule_gdm_dconf_compile() {
+  mkdir -p "${STATE_DIR}"
+  : >"${DCONF_REQ}"
+  if [[ -f "${DCONF_PIDFILE}" ]] && kill -0 "$(cat "${DCONF_PIDFILE}" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  (
+    printf '%s\n' "$$" >"${DCONF_PIDFILE}"
+    trap 'rm -f "${DCONF_PIDFILE}"' EXIT
+    while [[ -f "${DCONF_REQ}" ]]; do
+      rm -f "${DCONF_REQ}"
+      sleep "${DCONF_IDLE_SECS}"
+      [[ -f "${DCONF_REQ}" ]] && continue
+      dconf compile "${GDM_DCONF_DB}" "${GDM_DCONF_D}" 2>/dev/null || true
+    done
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+sync_theme() {
+  local user="$1" uid
+  local gtk_raw icon_raw font_raw cursor_raw color_scheme accent_raw
+  local gtk_name icon_name cursor_name font_name
+  local tmp path scheme
+
+  uid="$(id -u "${user}")"
+  [[ -e "$(user_runtime "${uid}")/bus" ]] || return 1
+
+  gtk_raw="$(get_user_gsettings "${user}" gtk-theme)" || return 0
+  icon_raw="$(get_user_gsettings "${user}" icon-theme)" || return 0
+  font_raw="$(get_user_gsettings "${user}" font-name)" || return 0
+  cursor_raw="$(get_user_gsettings "${user}" cursor-theme)" || return 0
+  color_scheme="$(get_user_gsettings "${user}" color-scheme)" || return 0
+  accent_raw="$(get_user_gsettings "${user}" accent-color)" || true
+
+  gtk_name="$(resolve_theme_name gtk-theme "${gtk_raw}" || true)"
+  icon_name="$(resolve_theme_name icon-theme "${icon_raw}" || true)"
+  cursor_name="$(resolve_theme_name cursor-theme "${cursor_raw}" || true)"
+  font_name="$(unquote_gvariant "${font_raw}")"
+
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' '[org/gnome/desktop/interface]'
+    [[ -n "${gtk_name}" ]] && printf 'gtk-theme=%s\n' "${gtk_raw}"
+    [[ -n "${icon_name}" ]] && printf 'icon-theme=%s\n' "${icon_raw}"
+    [[ -n "${font_name}" ]] && printf 'font-name=%s\n' "${font_raw}"
+    [[ -n "${cursor_name}" ]] && printf 'cursor-theme=%s\n' "${cursor_raw}"
+    printf 'color-scheme=%s\n' "${color_scheme}"
+    [[ -n "${accent_raw}" ]] && printf 'accent-color=%s\n' "${accent_raw}"
+  } >"${tmp}"
+
+  if ! cmp -s "${tmp}" "${GDM_DCONF_PATH}" 2>/dev/null; then
+    mkdir -p "$(dirname -- "${GDM_DCONF_PATH}")"
+    install -m 0644 "${tmp}" "${GDM_DCONF_PATH}"
+    schedule_gdm_dconf_compile
+  fi
+  rm -f "${tmp}"
+
+  case "${color_scheme}" in
+    *prefer-dark*|*dark*) scheme=1 ;;
+    *) scheme=0 ;;
+  esac
+
+  for path in "${GTK3_INI_PATH}" "${GTK4_INI_PATH}"; do
+    tmp="$(mktemp)"
+    {
+      printf '%s\n' '[Settings]'
+      [[ -n "${gtk_name}" ]] && printf 'gtk-theme-name=%s\n' "${gtk_name}"
+      [[ -n "${icon_name}" ]] && printf 'gtk-icon-theme-name=%s\n' "${icon_name}"
+      [[ -n "${font_name}" ]] && printf 'gtk-font-name=%s\n' "${font_name}"
+      [[ -n "${cursor_name}" ]] && printf 'gtk-cursor-theme-name=%s\n' "${cursor_name}"
+      printf 'gtk-application-prefer-dark-theme=%s\n' "${scheme}"
+    } >"${tmp}"
+    if ! cmp -s "${tmp}" "${path}" 2>/dev/null; then
+      mkdir -p "$(dirname -- "${path}")"
+      install -m 0644 "${tmp}" "${path}"
+    fi
+    rm -f "${tmp}"
+  done
+
+  update_symlinks 2>/dev/null || true
+}
+
+# Performance: original watchdog synced on every dconf write; only appearance keys.
+is_appearance_event() {
+  case "$1" in
+    */org/gnome/desktop/interface/gtk-theme* | \
+    */org/gnome/desktop/interface/icon-theme* | \
+    */org/gnome/desktop/interface/font-name* | \
+    */org/gnome/desktop/interface/cursor-theme* | \
+    */org/gnome/desktop/interface/color-scheme* | \
+    */org/gnome/desktop/interface/accent-color*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bootstrap_active_admin_user
+sync_theme "${active_user}"
+
+as_user "${active_user}" stdbuf -oL gdbus monitor --session \
+  --dest ca.desrt.dconf --object-path /ca/desrt/dconf/Writer/user 2>/dev/null \
+| while read -r line; do
+  is_appearance_event "${line}" || continue
+  sync_theme "${active_user}"
+done

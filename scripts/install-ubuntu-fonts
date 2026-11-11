@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Install classic Ubuntu fonts + Ubuntu Sans / Sans Mono system-wide (visible to GDM).
+# Downloads official archives (no distro package required — works on Atomic too).
+set -euo pipefail
+
+# Classic Ubuntu Font Family (Ubuntu / Ubuntu Mono), Canonical assets CDN.
+UBUNTU_CLASSIC_URL="${UBUNTU_CLASSIC_URL:-https://assets.ubuntu.com/v1/0cef8205-ubuntu-font-family-0.83.zip}"
+# Newer Ubuntu Sans + Ubuntu Sans Mono, Canonical GitHub releases.
+UBUNTU_SANS_URL="${UBUNTU_SANS_URL:-https://github.com/canonical/Ubuntu-Sans-fonts/releases/download/v1.006/UbuntuSans-fonts-1.006.zip}"
+UBUNTU_SANS_MONO_URL="${UBUNTU_SANS_MONO_URL:-https://github.com/canonical/Ubuntu-Sans-Mono-fonts/releases/download/v1.006/UbuntuSansMono-fonts-1.006.zip}"
+
+DEFAULT_SYSTEM_DIR="/usr/local/share/fonts/ubuntu"
+
+usage() {
+  cat <<'EOF'
+Usage: install-ubuntu-fonts [--system|--user] [--dir DIR]
+
+  Installs:
+    - Ubuntu (classic family, including Ubuntu Mono)
+    - Ubuntu Sans
+    - Ubuntu Sans Mono
+
+  --system   Install to /usr/local/share/fonts/ubuntu (default; needs sudo; GDM can use)
+  --user     Install to ~/.local/share/fonts/ubuntu (current user only; GDM cannot use)
+  --dir DIR  Install to DIR instead (uses sudo if DIR is not writable)
+
+Environment:
+  UBUNTU_CLASSIC_URL     Override classic zip URL
+  UBUNTU_SANS_URL        Override Ubuntu Sans zip URL
+  UBUNTU_SANS_MONO_URL   Override Ubuntu Sans Mono zip URL
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# Global: set by main when elevated operations are required.
+USE_SUDO=0
+
+as_root() {
+  if ((USE_SUDO)); then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+download() {
+  local url="$1" dest="$2"
+  printf 'Downloading %s\n' "${url}"
+  curl -fL --retry 3 --retry-delay 1 -o "${dest}" "${url}"
+}
+
+install_fonts_from_zip() {
+  local zip_path="$1" dest_dir="$2" label="$3"
+  local extract work family_dir
+  work="$(mktemp -d)"
+  extract="${work}/extract"
+  mkdir -p "${extract}"
+
+  unzip -q -o "${zip_path}" -d "${extract}"
+
+  local -a fonts=()
+  mapfile -t fonts < <(
+    find "${extract}" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) \
+      ! -path '*/__MACOSX/*' ! -path '*/.*' | sort
+  )
+  ((${#fonts[@]} > 0)) || die "no font files found in ${label} archive"
+
+  family_dir="${dest_dir}/${label}"
+  as_root mkdir -p "${family_dir}"
+  # Replace previous install of this family for idempotent updates.
+  as_root find "${family_dir}" -maxdepth 1 -type f \
+    \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) -delete
+
+  local f
+  for f in "${fonts[@]}"; do
+    as_root cp -f -- "${f}" "${family_dir}/"
+  done
+  # Zips may preserve mode 600; fonts must be world-readable for fontconfig/GDM.
+  as_root find "${family_dir}" -maxdepth 1 -type f \
+    \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) -exec chmod 644 {} +
+
+  printf '  %s: installed %d file(s) -> %s\n' "${label}" "${#fonts[@]}" "${family_dir}"
+  rm -rf "${work}"
+}
+
+main() {
+  local dest="" mode="system"
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --user)
+        mode="user"
+        shift
+        ;;
+      --system)
+        mode="system"
+        shift
+        ;;
+      --dir)
+        [[ "${#}" -ge 2 ]] || die "--dir requires a path"
+        dest="$2"
+        mode="custom"
+        shift 2
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  need_cmd curl
+  need_cmd unzip
+  need_cmd fc-cache
+  need_cmd find
+  need_cmd mktemp
+
+  case "${mode}" in
+    user)
+      dest="${HOME}/.local/share/fonts/ubuntu"
+      ;;
+    system)
+      dest="${DEFAULT_SYSTEM_DIR}"
+      ;;
+    custom)
+      [[ -n "${dest}" ]] || die "empty --dir"
+      ;;
+  esac
+
+  local parent
+  parent="$(dirname -- "${dest}")"
+  if [[ ! -d "${dest}" ]]; then
+    if [[ -w "${parent}" ]] || mkdir -p "${dest}" 2>/dev/null; then
+      :
+    else
+      USE_SUDO=1
+    fi
+  elif [[ ! -w "${dest}" ]]; then
+    USE_SUDO=1
+  fi
+
+  if ((USE_SUDO)); then
+    need_cmd sudo
+  fi
+
+  as_root mkdir -p "${dest}"
+
+  # Path must be baked into the trap: a local `tmp` is unbound when EXIT runs.
+  local tmp
+  tmp="$(mktemp -d)"
+  trap "rm -rf $(printf '%q' "${tmp}")" EXIT
+
+  download "${UBUNTU_CLASSIC_URL}" "${tmp}/ubuntu-classic.zip"
+  download "${UBUNTU_SANS_URL}" "${tmp}/ubuntu-sans.zip"
+  download "${UBUNTU_SANS_MONO_URL}" "${tmp}/ubuntu-sans-mono.zip"
+
+  install_fonts_from_zip "${tmp}/ubuntu-classic.zip" "${dest}" "ubuntu-classic"
+  install_fonts_from_zip "${tmp}/ubuntu-sans.zip" "${dest}" "ubuntu-sans"
+  install_fonts_from_zip "${tmp}/ubuntu-sans-mono.zip" "${dest}" "ubuntu-sans-mono"
+
+  printf 'Refreshing font cache...\n'
+  as_root fc-cache -f "${dest}" >/dev/null
+
+  printf '\nOK: Ubuntu fonts installed under %s\n' "${dest}"
+  if [[ "${dest}" == "${DEFAULT_SYSTEM_DIR}" || "${mode}" == "system" ]]; then
+    printf 'System-wide install: GDM and all users can use these fonts.\n'
+  fi
+  printf 'Families visible to fontconfig (sample):\n'
+  # Avoid SIGPIPE/141 under pipefail when head closes the pipe early.
+  mapfile -t _font_sample < <(fc-list | grep -iE 'ubuntu' | sort -u | head -n 40 || true)
+  local _line
+  for _line in "${_font_sample[@]:-}"; do
+    printf '  %s\n' "${_line}"
+  done
+}
+
+main "$@"

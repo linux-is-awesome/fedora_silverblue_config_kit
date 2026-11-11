@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for user session start (adw-gtk3 theme sync)
+
+[Path]
+PathChanged=/run/user/
+
+[Install]
+WantedBy=multi-user.target

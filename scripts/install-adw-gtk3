@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Install adw-gtk3 (libadwaita look for GTK3) via distro packages:
+#   - Host: rpm-ostree layer adw-gtk3-theme
+#   - Flathub: org.gtk.Gtk3theme.adw-gtk3{,-dark} (org.freedesktop / org.gnome.Platform)
+#   - Fedora Flatpak GTK3 apps: copy themes into /var/usrlocal/share/themes +
+#     filesystem override (same pattern as Tela icons; Flatpak cannot share /usr,
+#     and Fedora runtimes cannot use Flathub Gtk3theme extensions)
+# Upstream: https://github.com/lassekongo83/adw-gtk3
+set -euo pipefail
+
+RPM_PKG="${RPM_PKG:-adw-gtk3-theme}"
+FLATHUB_THEMES=(
+  org.gtk.Gtk3theme.adw-gtk3
+  org.gtk.Gtk3theme.adw-gtk3-dark
+)
+RPM_THEMES_DIR="${RPM_THEMES_DIR:-/usr/share/themes}"
+FLATPAK_THEMES_DIR="${FLATPAK_THEMES_DIR:-/var/usrlocal/share/themes}"
+THEME_NAMES=(adw-gtk3 adw-gtk3-dark)
+
+usage() {
+  cat <<'EOF'
+Usage: install-adw-gtk3 [--no-rpm] [--no-flatpak] [--apply-dark|--apply-light]
+
+  Installs adw-gtk3 for legacy GTK3 apps:
+    - Host:     rpm-ostree install adw-gtk3-theme  (reboot to apply new deployment)
+    - Flathub:  org.gtk.Gtk3theme.adw-gtk3{,-dark}
+    - Flatpak:  copy RPM themes → /var/usrlocal/share/themes + filesystem override
+                (Fedora-runtime GTK3 apps; re-run after theme RPM updates)
+
+  --no-rpm       Skip rpm-ostree layer
+  --no-flatpak   Skip Flatpak theme install / overrides
+  --apply-dark   Set GNOME gtk-theme to adw-gtk3-dark (and prefer-dark)
+  --apply-light  Set GNOME gtk-theme to adw-gtk3 (and default color-scheme)
+
+Environment:
+  RPM_PKG   Override RPM name (default: adw-gtk3-theme)
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+package_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+is_layered() {
+  local pkg="$1"
+  rpm-ostree status 2>/dev/null | grep -E 'LayeredPackages:.*\b'"${pkg}"'\b' >/dev/null 2>&1
+}
+
+install_rpm_theme() {
+  need_cmd rpm-ostree
+  need_cmd rpm
+  need_cmd sudo
+
+  if package_installed "${RPM_PKG}"; then
+    printf 'RPM already installed: %s\n' "${RPM_PKG}"
+    return 0
+  fi
+  if is_layered "${RPM_PKG}"; then
+    printf 'RPM already layered (reboot to apply): %s\n' "${RPM_PKG}"
+    return 0
+  fi
+
+  printf 'Layering %s via rpm-ostree (survives upgrades; reboot required)...\n' "${RPM_PKG}"
+  sudo rpm-ostree install "${RPM_PKG}"
+  printf 'Queued. Reboot (or: sudo rpm-ostree apply-live) to use the new deployment.\n'
+}
+
+have_system_remote() {
+  flatpak remote-list --system --columns=name 2>/dev/null | grep -qx "$1"
+}
+
+# Copy (do not symlink): Flatpak replaces /usr with the runtime, so links into
+# /usr/share/themes are broken inside the sandbox.
+install_themes_for_flatpak() {
+  local name src dst
+  as_root install -d -m 755 "${FLATPAK_THEMES_DIR}"
+  for name in "${THEME_NAMES[@]}"; do
+    src="${RPM_THEMES_DIR}/${name}"
+    dst="${FLATPAK_THEMES_DIR}/${name}"
+    [[ -d "${src}" ]] || die "RPM theme missing: ${src} (install/reboot adw-gtk3-theme first)"
+    as_root rm -rf "${dst}"
+    as_root cp -a "${src}" "${dst}"
+    printf 'Installed Flatpak-visible theme: %s\n' "${dst}"
+  done
+}
+
+install_flatpak_theme_access() {
+  need_cmd flatpak
+  install_themes_for_flatpak
+
+  # Same share root / XDG pattern as install-tela-icons.
+  local xdg_data_dirs
+  xdg_data_dirs="/var/usrlocal/share:/app/share:/usr/share:/usr/share/runtime/share:/run/host/user-share:/run/host/share"
+
+  printf 'Allowing Flatpak apps to read GTK3 themes at %s ...\n' "${FLATPAK_THEMES_DIR}"
+  local -a args=(
+    --filesystem="${FLATPAK_THEMES_DIR}:ro"
+    --env=XDG_DATA_DIRS="${xdg_data_dirs}"
+  )
+
+  flatpak override --user "${args[@]}"
+  if flatpak override --help 2>&1 | grep -q -- '--system'; then
+    as_root flatpak override --system "${args[@]}" \
+      || printf 'warning: could not set system Flatpak override (user override still set)\n' >&2
+  fi
+  printf 'Flatpak theme override set.\n'
+}
+
+install_flatpak_themes() {
+  need_cmd flatpak
+  need_cmd sudo
+
+  if ! have_system_remote flathub; then
+    printf 'Adding Flathub remote (system)...\n'
+    sudo flatpak remote-add --system --if-not-exists flathub \
+      https://dl.flathub.org/repo/flathub.flatpakrepo
+  fi
+
+  printf 'Installing Flathub GTK3 themes (system)...\n'
+  sudo flatpak install -y --system flathub "${FLATHUB_THEMES[@]}"
+
+  install_flatpak_theme_access
+
+  printf 'Flatpak themes installed (system):\n'
+  local id
+  for id in "${FLATHUB_THEMES[@]}"; do
+    flatpak info --system "${id}" >/dev/null 2>&1 && printf '  %s\n' "${id}"
+  done
+}
+
+apply_gnome_theme() {
+  local variant="$1"
+  need_cmd gsettings
+  case "${variant}" in
+    dark)
+      gsettings set org.gnome.desktop.interface gtk-theme 'adw-gtk3-dark'
+      gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+      printf 'Applied GNOME gtk-theme=adw-gtk3-dark (prefer-dark).\n'
+      ;;
+    light)
+      gsettings set org.gnome.desktop.interface gtk-theme 'adw-gtk3'
+      gsettings set org.gnome.desktop.interface color-scheme 'default'
+      printf 'Applied GNOME gtk-theme=adw-gtk3 (default).\n'
+      ;;
+  esac
+}
+
+main() {
+  local do_rpm=1 do_flatpak=1 apply=""
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --no-rpm)
+        do_rpm=0
+        shift
+        ;;
+      --no-flatpak)
+        do_flatpak=0
+        shift
+        ;;
+      --apply-dark)
+        apply="dark"
+        shift
+        ;;
+      --apply-light)
+        apply="light"
+        shift
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if ((do_rpm)); then
+    install_rpm_theme
+  else
+    printf 'Skipped RPM install (--no-rpm).\n'
+  fi
+
+  if ((do_flatpak)); then
+    install_flatpak_themes
+  else
+    printf 'Skipped Flatpak theme install (--no-flatpak).\n'
+  fi
+
+  if [[ -n "${apply}" ]]; then
+    apply_gnome_theme "${apply}"
+  else
+    printf '\nActivate legacy GTK3 theme after reboot (if RPM was layered), e.g.:\n'
+    printf '  gsettings set org.gnome.desktop.interface gtk-theme adw-gtk3-dark\n'
+    printf '  gsettings set org.gnome.desktop.interface color-scheme prefer-dark\n'
+    printf 'Or re-run with --apply-dark / --apply-light.\n'
+  fi
+
+  printf '\nOK: adw-gtk3 package install finished.\n'
+}
+
+main "$@"

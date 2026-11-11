@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Hide the GRUB menu by default on Fedora Atomic (Silverblue/Kinoite/…).
+# Esc (or Shift) still opens the menu during boot.
+#
+# On Atomic Desktops (Fedora 41+), do not use /etc/default/grub + grub2-mkconfig.
+# Put overrides in /boot/grub2/user.cfg instead.
+set -euo pipefail
+
+USER_CFG="${USER_CFG:-/boot/grub2/user.cfg}"
+
+usage() {
+  cat <<'EOF'
+Usage: hide-grub-menu
+
+  Writes /boot/grub2/user.cfg so the GRUB menu is hidden by default.
+  Existing unrelated lines in user.cfg are preserved.
+
+  Esc / Shift during boot still opens the menu.
+
+Environment:
+  USER_CFG   Path to GRUB user config (default: /boot/grub2/user.cfg)
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+ensure_user_cfg_settings() {
+  local cfg="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  if [[ -f "${cfg}" ]]; then
+    # Drop previous timeout / timeout_style lines; keep everything else.
+    grep -Ev '^[[:space:]]*set[[:space:]]+(timeout|timeout_style)=' "${cfg}" >"${tmp}" || true
+  else
+    : >"${tmp}"
+  fi
+
+  {
+    cat "${tmp}"
+    printf 'set timeout_style=hidden\n'
+    printf 'set timeout=0\n'
+  } | sudo tee "${cfg}" >/dev/null
+
+  rm -f "${tmp}"
+  sudo chmod 644 "${cfg}"
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  need_cmd sudo
+
+  local boot_dir
+  boot_dir="$(dirname -- "${USER_CFG}")"
+  [[ -d "${boot_dir}" ]] || die "boot directory missing: ${boot_dir}"
+
+  ensure_user_cfg_settings "${USER_CFG}"
+
+  printf 'OK: GRUB menu hidden by default\n'
+  printf '  config : %s\n' "${USER_CFG}"
+  printf '  show   : press Esc (or Shift) during boot\n'
+  printf '\nTakes effect on next reboot (no rpm-ostree rebuild needed).\n'
+  printf 'Current file:\n'
+  sudo cat "${USER_CFG}" | sed 's/^/  /'
+}
+
+main "$@"

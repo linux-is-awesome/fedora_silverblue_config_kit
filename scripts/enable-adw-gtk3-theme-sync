@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Sync gtk-theme to the light/dark adw-gtk3 pair when GNOME color-scheme changes.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../config/theme-sync"
+LIB_DST="${LIB_DST:-/usr/local/lib/theme-sync}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+UNIT_NAME="adw-gtk3-theme-sync"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-adw-gtk3-theme-sync [--undo]
+
+  Installs a systemd path/service that, after an admin user logs in, syncs
+  gtk-theme to the matching light/dark theme:
+    prefer-dark          → adw-gtk3-dark (or <theme>-dark)
+    default/prefer-light → adw-gtk3     (strip trailing -dark)
+
+  Only switches when the target theme exists under /usr/local/share/themes
+  or /usr/share/themes. Requires wheel, sudo, or admin.
+
+  --undo   Disable units and remove installed files for this feature.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_files() {
+  local f
+  for f in common.sh adw-gtk3-theme-sync; do
+    [[ -f "${SRC_DIR}/${f}" ]] || die "missing ${SRC_DIR}/${f}"
+  done
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.service" ]] || die "missing unit files"
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.path" ]] || die "missing path unit"
+
+  as_root install -d -m 755 "${LIB_DST}" "${UNIT_DIR}"
+  as_root install -m 644 "${SRC_DIR}/common.sh" "${LIB_DST}/common.sh"
+  as_root install -m 755 "${SRC_DIR}/adw-gtk3-theme-sync" "${LIB_DST}/adw-gtk3-theme-sync"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.service" "${UNIT_DIR}/${UNIT_NAME}.service"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.path" "${UNIT_DIR}/${UNIT_NAME}.path"
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "${UNIT_NAME}.path"
+  # Restart (not start): pick up newly installed script if the service was already running.
+  as_root systemctl restart "${UNIT_NAME}.service"
+
+  printf 'Enabled %s.path and restarted %s.service\n' "${UNIT_NAME}" "${UNIT_NAME}"
+  printf 'Dark/light mode now switches gtk-theme to the matching adw-gtk3 theme.\n'
+}
+
+undo() {
+  as_root systemctl disable --now "${UNIT_NAME}.path" 2>/dev/null || true
+  as_root systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+  as_root rm -f \
+    "${UNIT_DIR}/${UNIT_NAME}.path" \
+    "${UNIT_DIR}/${UNIT_NAME}.service" \
+    "${LIB_DST}/adw-gtk3-theme-sync"
+  if [[ ! -e "${LIB_DST}/gdm-theme-sync" ]]; then
+    as_root rm -f \
+      "${LIB_DST}/common.sh" \
+      "${LIB_DST}/update-gtk-settings-symlinks"
+    as_root rmdir "${LIB_DST}" 2>/dev/null || true
+  fi
+  as_root systemctl daemon-reload
+  printf 'Removed %s\n' "${UNIT_NAME}"
+}
+
+main() {
+  need_cmd sudo
+  need_cmd systemctl
+
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --undo)
+      undo
+      ;;
+    "")
+      install_files
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

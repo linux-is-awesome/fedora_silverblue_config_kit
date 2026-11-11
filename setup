@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Interactive menu to run Fedora Silverblue config scripts in this project.
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPTS="${ROOT}/scripts"
+
+if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != 1 ]] && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET= C_BOLD= C_DIM= C_RED= C_GREEN= C_YELLOW=
+  C_BLUE= C_MAGENTA= C_CYAN=
+fi
+
+die() {
+  printf '%serror:%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2
+  exit 1
+}
+
+pause() {
+  echo
+  read -r -p "${C_DIM}Press Enter to return to the menu…${C_RESET}" _
+}
+
+# Menu definition:
+#   @Section title                 → section header (not numbered)
+#   id|label|description|script    → action (script is relative to scripts/)
+MENU=(
+  '@Boot & disk'
+  'backup-luks|Backup LUKS header|Save encryption header to a directory you choose|backup-luks-header'
+  'hide-grub|Hide GRUB menu|Boot without GRUB menu (Esc still opens it)|hide-grub-menu'
+  'tpm-unlock|TPM disk unlock|Skip LUKS password at boot via TPM2|enable-tpm-unlock'
+
+  '@System packages'
+  'remove-apps|Remove base apps|Firefox, Help, Tour, System Monitor (rpm-ostree)|remove-base-apps'
+  'virt-manager|Install virt-manager|Native QEMU/KVM + libvirt + virt-manager (rpm-ostree)|install-virt-manager'
+  'host-monitoring|Host monitoring extras|RAPL power, nethogs, SMART, sensors for system monitors|enable-host-monitoring'
+  'samba|Setup Samba shares|Usershares; ~/Public follows Settings File Sharing (WebDAV+SMB)|enable-samba'
+
+  '@Fonts'
+  'ubuntu-fonts|Install Ubuntu fonts|Ubuntu + Sans + Sans Mono system-wide (for GDM)|install-ubuntu-fonts'
+  'dejavu-fonts|Install DejaVu fonts|DejaVu Sans Mono system-wide (Ubuntu monospace default)|install-dejavu-fonts'
+  'ms-fonts|Install Microsoft fonts|Arial/Times/… core fonts system-wide (for GDM)|install-microsoft-fonts'
+  'ubuntu-look|Configure Ubuntu font look|GNOME + fontconfig → Ubuntu style|configure-ubuntu-fonts'
+
+  '@Appearance'
+  'adw-gtk3|Install adw-gtk3 theme|adw-gtk3-theme (rpm-ostree) + Flatpak themes|install-adw-gtk3'
+  'tela-icons|Install Tela icons|Tela icon theme system-wide + Flatpak access|install-tela-icons'
+  'sync-gdm|Sync settings to GDM|Monitors + fonts/theme from this session → login screen|sync-gdm-settings'
+  'gdm-theme-sync|Auto-sync theme to GDM|Live sync gtk/icons/fonts to greeter + system GTK|enable-gdm-theme-sync'
+  'adw-theme-sync|Auto adw-gtk3 light/dark|Sync gtk-theme to dark/light (adw-gtk3 ↔ adw-gtk3-dark)|enable-adw-gtk3-theme-sync'
+
+  '@Desktop & auth'
+  'terminal-shortcut|Terminal shortcut|Ctrl+Alt+T → xdg-terminal-exec|bind-terminal-shortcut'
+  'printer-auth|Disable printer password|Configure printers without polkit password (wheel)|disable-printer-auth'
+  'sudo-dots|Sudo password dots|Show asterisks when typing sudo password in terminal|enable-sudo-pwfeedback'
+  'sudo-nofp|Disable sudo fingerprint|Password-only for sudo/polkit; keep login fingerprint|disable-sudo-fingerprint'
+)
+
+# Parallel arrays filled by build_action_index: ACTION_IDS / ACTION_ENTRIES
+ACTION_IDS=()
+ACTION_ENTRIES=()
+
+build_action_index() {
+  ACTION_IDS=()
+  ACTION_ENTRIES=()
+  local item
+  for item in "${MENU[@]}"; do
+    [[ "${item}" == @* ]] && continue
+    local id
+    IFS='|' read -r id _ <<<"${item}"
+    ACTION_IDS+=("${id}")
+    ACTION_ENTRIES+=("${item}")
+  done
+}
+
+print_header() {
+  clear 2>/dev/null || true
+  printf '%s%sFedora Silverblue config%s\n' "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
+  printf '%s%s%s\n\n' "${C_DIM}" "${ROOT}" "${C_RESET}"
+}
+
+print_menu() {
+  print_header
+  printf '%sSelect an action:%s\n' "${C_BOLD}" "${C_RESET}"
+
+  local i=1 item id label desc script
+  for item in "${MENU[@]}"; do
+    if [[ "${item}" == @* ]]; then
+      printf '\n  %s%s%s\n' "${C_MAGENTA}${C_BOLD}" "${item#@}" "${C_RESET}"
+      continue
+    fi
+    IFS='|' read -r id label desc script <<<"${item}"
+    printf '  %s%2d)%s %s%-24s%s %s%s%s\n' \
+      "${C_GREEN}" "${i}" "${C_RESET}" \
+      "${C_BOLD}" "${label}" "${C_RESET}" \
+      "${C_DIM}" "${desc}" "${C_RESET}"
+    i=$((i + 1))
+  done
+
+  printf '\n  %s%2d)%s %sQuit%s\n' "${C_YELLOW}" "0" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+  echo
+}
+
+run_script() {
+  local name="$1"
+  shift || true
+  local path="${SCRIPTS}/${name}"
+  [[ -f "${path}" ]] || die "missing script: ${path}"
+  [[ -x "${path}" ]] || chmod +x "${path}"
+
+  printf '%s→%s %s' "${C_CYAN}" "${C_RESET}" "${path}"
+  if [[ "${#}" -gt 0 ]]; then
+    printf ' %q' "$@"
+  fi
+  printf '\n\n'
+
+  "${path}" "$@"
+}
+
+prompt_backup_dir() {
+  local default="" dir
+  if [[ -d "/run/media/${USER}/External/Backups" ]]; then
+    default="/run/media/${USER}/External/Backups"
+  fi
+
+  if [[ -n "${default}" ]]; then
+    read -r -p "Backup directory [${default}]: " dir
+    dir="${dir:-${default}}"
+  else
+    read -r -p "Backup directory: " dir
+  fi
+  [[ -n "${dir}" ]] || die "backup directory is required"
+  printf '%s\n' "${dir}"
+}
+
+run_entry() {
+  local index="$1"
+  local entry="${ACTION_ENTRIES[$((index - 1))]}"
+  local id label desc script
+  IFS='|' read -r id label desc script <<<"${entry}"
+
+  echo
+  printf '%s%s%s\n' "${C_BOLD}" "${label}" "${C_RESET}"
+  printf '%s%s%s\n\n' "${C_DIM}" "${desc}" "${C_RESET}"
+
+  case "${id}" in
+    backup-luks)
+      local backup_dir
+      backup_dir="$(prompt_backup_dir)"
+      run_script "${script}" "${backup_dir}"
+      ;;
+    *)
+      run_script "${script}"
+      ;;
+  esac
+}
+
+main() {
+  [[ -t 0 ]] || die "interactive terminal required (run from a host shell, not piped)"
+  [[ -d "${SCRIPTS}" ]] || die "scripts directory missing: ${SCRIPTS}"
+
+  build_action_index
+  ((${#ACTION_ENTRIES[@]} > 0)) || die "menu has no actions"
+
+  local choice
+  while true; do
+    print_menu
+    read -r -p "${C_BOLD}Enter number:${C_RESET} " choice
+
+    case "${choice}" in
+      0|q|Q)
+        printf '%sBye.%s\n' "${C_DIM}" "${C_RESET}"
+        exit 0
+        ;;
+      '')
+        continue
+        ;;
+      *[!0-9]*)
+        printf '%sInvalid selection.%s\n' "${C_RED}" "${C_RESET}"
+        sleep 1
+        continue
+        ;;
+    esac
+
+    if ((choice < 1 || choice > ${#ACTION_ENTRIES[@]})); then
+      printf '%sInvalid selection.%s\n' "${C_RED}" "${C_RESET}"
+      sleep 1
+      continue
+    fi
+
+    # Keep the menu alive if a child script fails.
+    set +e
+    run_entry "${choice}"
+    local rc=$?
+    set -e
+
+    if ((rc != 0)); then
+      printf '\n%sCommand exited with status %d.%s\n' "${C_RED}" "${rc}" "${C_RESET}"
+    fi
+    pause
+  done
+}
+
+main "$@"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync adw-gtk3 gtk-theme (light/dark) from GNOME color-scheme
+After=accounts-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/theme-sync/adw-gtk3-theme-sync
+Restart=on-failure
+RestartSec=2

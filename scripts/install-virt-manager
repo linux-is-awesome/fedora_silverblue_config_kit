@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Install native virt-manager + QEMU/KVM/libvirt on Fedora Silverblue (rpm-ostree).
+# No Flatpak — full host stack for USB passthrough, SPICE, UEFI, TPM, etc.
+set -euo pipefail
+
+# Meta packages pull the driver/QEMU deps; extras cover UEFI + emulated TPM (Win11).
+PKGS=(
+  virt-manager
+  virt-viewer
+  virt-install
+  qemu-kvm
+  libvirt-daemon-kvm
+  libvirt-daemon-config-network
+  libvirt-client
+  swtpm-tools
+  edk2-ovmf
+)
+
+usage() {
+  cat <<'EOF'
+Usage: install-virt-manager [--configure-only]
+
+  Layers a full native virtualization stack via rpm-ostree, then (after the
+  packages are present) enables libvirt and sets up system-session access.
+
+  Packages:
+    virt-manager virt-viewer virt-install
+    qemu-kvm libvirt-daemon-kvm libvirt-daemon-config-network libvirt-client
+    swtpm-tools edk2-ovmf
+
+  After layering: reboot, then re-run this script (or pass --configure-only)
+  to enable services, default NAT network, and libvirt group membership.
+
+  --configure-only   Skip rpm-ostree; only run post-install setup
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+package_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+all_pkgs_installed() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || return 1
+  done
+  return 0
+}
+
+missing_pkgs() {
+  local p
+  for p in "${PKGS[@]}"; do
+    package_installed "${p}" || printf '%s\n' "${p}"
+  done
+}
+
+layer_packages() {
+  need_cmd rpm-ostree
+  need_cmd rpm
+  need_cmd sudo
+
+  if all_pkgs_installed; then
+    printf 'All virtualization packages already installed.\n'
+    return 0
+  fi
+
+  local -a need=()
+  mapfile -t need < <(missing_pkgs)
+  printf 'Layering via rpm-ostree (%d package(s))...\n' "${#need[@]}"
+  local p
+  for p in "${need[@]}"; do
+    printf '  %s\n' "${p}"
+  done
+
+  as_root rpm-ostree install "${need[@]}"
+  printf '\nQueued. Reboot into the new deployment, then re-run:\n'
+  printf '  %s --configure-only\n' "$(basename -- "$0")"
+}
+
+ensure_libvirt_group() {
+  # On Silverblue, libvirt may exist only in /usr/lib/group (getent still works).
+  # usermod -aG needs a writable /etc/group entry — copy it first if missing.
+  if ! grep -qE '^libvirt:' /etc/group 2>/dev/null; then
+    if grep -qE '^libvirt:' /usr/lib/group 2>/dev/null; then
+      printf 'Adding libvirt group to /etc/group...\n'
+      as_root sh -c 'grep -E "^libvirt:" /usr/lib/group >> /etc/group'
+    elif ! getent group libvirt >/dev/null 2>&1; then
+      printf 'Creating libvirt group...\n'
+      as_root groupadd --system libvirt
+    fi
+  fi
+
+  local user="${SUDO_USER:-${USER}}"
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    user="${SUDO_USER}"
+  fi
+  [[ "${user}" != root ]] || die "refusing to add root to libvirt; run as your user with sudo"
+
+  if getent group libvirt | grep -qE "(^|:|,)${user}(,|$)"; then
+    printf 'User %s already in libvirt group.\n' "${user}"
+  else
+    printf 'Adding %s to libvirt group...\n' "${user}"
+    as_root usermod -aG libvirt "${user}"
+    printf 'Log out and back in (or reboot) for group membership to apply.\n'
+  fi
+}
+
+enable_libvirt_services() {
+  # Prefer classic libvirtd when present; otherwise modular sockets.
+  if systemctl list-unit-files libvirtd.service 2>/dev/null | grep -q libvirtd.service; then
+    printf 'Enabling libvirtd...\n'
+    as_root systemctl enable --now libvirtd.service
+  else
+    printf 'Enabling modular libvirt sockets...\n'
+    local u
+    for u in virtqemud.socket virtnetworkd.socket virtstoraged.socket virtnodedevd.socket; do
+      if systemctl list-unit-files "${u}" 2>/dev/null | grep -q "${u}"; then
+        as_root systemctl enable --now "${u}"
+      fi
+    done
+  fi
+}
+
+ensure_default_network() {
+  need_cmd virsh
+  if ! as_root virsh net-info default >/dev/null 2>&1; then
+    printf 'warning: libvirt network "default" not found (is libvirt-daemon-config-network installed?)\n' >&2
+    return 0
+  fi
+
+  local info active=0
+  info="$(as_root virsh net-info default 2>/dev/null || true)"
+  if printf '%s\n' "${info}" | grep -qiE 'Active:[[:space:]]*(yes|true)'; then
+    active=1
+  fi
+
+  if ((active)); then
+    printf 'libvirt network default is active.\n'
+  else
+    printf 'Starting libvirt network default...\n'
+    # Already-active is fine (race / wording mismatch across libvirt versions).
+    if ! out="$(as_root virsh net-start default 2>&1)"; then
+      if printf '%s\n' "${out}" | grep -qi 'already active'; then
+        printf 'libvirt network default is already active.\n'
+      else
+        printf '%s\n' "${out}" >&2
+        return 1
+      fi
+    fi
+  fi
+  as_root virsh net-autostart default >/dev/null
+  printf 'libvirt network default set to autostart.\n'
+}
+
+configure() {
+  need_cmd sudo
+  all_pkgs_installed || die "packages not installed yet; reboot after rpm-ostree, or run without --configure-only"
+
+  if [[ ! -e /dev/kvm ]]; then
+    die "/dev/kvm missing — enable virtualization in firmware (VT-x/AMD-V)"
+  fi
+  printf '/dev/kvm present.\n'
+
+  enable_libvirt_services
+  ensure_libvirt_group
+  ensure_default_network
+
+  printf '\nOK: native virt-manager stack configured.\n'
+  printf 'Launch: virt-manager  (QEMU/KVM system connection)\n'
+  printf 'Check:  virt-host-validate qemu\n'
+}
+
+main() {
+  local configure_only=0
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --configure-only)
+        configure_only=1
+        shift
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if ((configure_only)); then
+    configure
+    return 0
+  fi
+
+  layer_packages
+
+  if all_pkgs_installed; then
+    configure
+  else
+    printf '\nPackages are staged but not active in this boot yet.\n'
+  fi
+}
+
+main "$@"

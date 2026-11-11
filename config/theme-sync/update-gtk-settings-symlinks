@@ -1,0 +1,27 @@
+#!/bin/sh
+# Symlink watchdog-managed GTK settings into /etc for system GTK apps.
+set -eu
+
+STATE_DIR="${STATE_DIR:-/var/lib/theme-sync}"
+GTK3_TARGET="${GTK3_TARGET:-/etc/gtk-3.0/settings.ini}"
+GTK4_TARGET="${GTK4_TARGET:-/etc/gtk-4.0/settings.ini}"
+
+link_or_clean() {
+  src="$1"
+  link="$2"
+  if [ -f "$src" ]; then
+    mkdir -p "$(dirname "$link")" 2>/dev/null || true
+    ln -sfn "$src" "$link" 2>/dev/null || true
+  else
+    # Only remove if it points at our state dir.
+    if [ -L "$link" ]; then
+      target="$(readlink "$link" 2>/dev/null || true)"
+      case "$target" in
+        "${STATE_DIR}"/*) rm -f "$link" 2>/dev/null || true ;;
+      esac
+    fi
+  fi
+}
+
+link_or_clean "${STATE_DIR}/gtk-3.0/settings.ini" "${GTK3_TARGET}"
+link_or_clean "${STATE_DIR}/gtk-4.0/settings.ini" "${GTK4_TARGET}"

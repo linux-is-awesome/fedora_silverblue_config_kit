@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# Unlock a LUKS volume automatically at boot using the machine TPM2.
+# This does NOT store your passphrase in BIOS/UEFI. It seals a separate
+# unlock key to the TPM (systemd-cryptenroll). Your passphrase slot stays.
+#
+# Trade-off: anyone who can boot this same laptop past firmware can unlock
+# the disk without knowing the passphrase. Keep a strong passphrase + header backup.
+set -euo pipefail
+
+# PCR 7 = Secure Boot policy. Practical default on Fedora Atomic + GRUB.
+# Higher PCRs (4/8/9/…) often break auto-unlock after updates.
+DEFAULT_PCRS="${DEFAULT_PCRS:-7}"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-tpm-unlock [device]
+       enable-tpm-unlock --unenroll [device]
+
+  device   Optional LUKS block device. If omitted, lists LUKS devices and asks.
+
+  Enrolls TPM2 as an alternate LUKS unlock method and ensures the initramfs
+  can talk to the TPM on Atomic hosts (rpm-ostree).
+
+  You will be prompted for the existing LUKS passphrase once.
+
+Options / environment:
+  --pcrs LIST     PCR list for sealing (default: 7). Example: 7+14
+  --unenroll      Remove TPM2 unlock slot(s) from the device
+  DEFAULT_PCRS    Same as --pcrs when not passed on the CLI
+
+Examples:
+  enable-tpm-unlock
+  enable-tpm-unlock /dev/nvme0n1p4
+  enable-tpm-unlock --pcrs 7+14 /dev/nvme0n1p4
+  enable-tpm-unlock --unenroll /dev/nvme0n1p4
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+list_luks_candidates() {
+  local name fstype size type pkname model
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    name="$(awk '{print $1}' <<<"${line}")"
+    fstype="$(awk '{print $2}' <<<"${line}")"
+    size="$(awk '{print $3}' <<<"${line}")"
+    type="$(awk '{print $4}' <<<"${line}")"
+    pkname="$(awk '{print $5}' <<<"${line}")"
+    [[ "${fstype}" == "crypto_LUKS" ]] || continue
+    [[ "${type}" == "part" || "${type}" == "disk" ]] || continue
+    model=""
+    if [[ -n "${pkname}" && -b "/dev/${pkname}" ]]; then
+      model="$(lsblk -dno MODEL "/dev/${pkname}" 2>/dev/null | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    elif [[ "${type}" == "disk" ]]; then
+      model="$(lsblk -dno MODEL "/dev/${name}" 2>/dev/null | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+    printf '%s\t%s\t%s\n' "/dev/${name}" "${size}" "${model:-}"
+  done < <(lsblk -rno NAME,FSTYPE,SIZE,TYPE,PKNAME)
+}
+
+resolve_device() {
+  local requested="${1:-}"
+  if [[ -n "${requested}" ]]; then
+    [[ -b "${requested}" ]] || die "not a block device: ${requested}"
+    sudo cryptsetup isLuks "${requested}" \
+      || die "not a LUKS device: ${requested}"
+    printf '%s\n' "${requested}"
+    return
+  fi
+
+  [[ -t 0 ]] || die "no device given; pass one as an argument (stdin is not a TTY)"
+
+  local -a devices=() sizes=() models=()
+  local path size model
+  while IFS=$'\t' read -r path size model; do
+    [[ -n "${path}" ]] || continue
+    devices+=("${path}")
+    sizes+=("${size}")
+    models+=("${model}")
+  done < <(list_luks_candidates)
+
+  ((${#devices[@]} > 0)) || die "no LUKS devices found"
+
+  printf 'Select LUKS device:\n' >&2
+  local i
+  for i in "${!devices[@]}"; do
+    printf '  %d) %s  (%s' "$((i + 1))" "${devices[$i]}" "${sizes[$i]}" >&2
+    if [[ -n "${models[$i]}" ]]; then
+      printf ', %s' "${models[$i]}" >&2
+    fi
+    printf ')\n' >&2
+  done
+
+  local choice
+  while true; do
+    printf 'Enter number [1-%d]: ' "${#devices[@]}" >&2
+    read -r choice
+    if [[ "${choice}" =~ ^[0-9]+$ ]] \
+      && ((choice >= 1 && choice <= ${#devices[@]})); then
+      printf '%s\n' "${devices[$((choice - 1))]}"
+      return
+    fi
+    printf 'Invalid selection.\n' >&2
+  done
+}
+
+ensure_tpm_present() {
+  [[ -e /dev/tpmrm0 || -e /dev/tpm0 ]] \
+    || die "no TPM device found (/dev/tpmrm0). Enable TPM in firmware setup."
+}
+
+initramfs_has_tpm2() {
+  command -v lsinitrd >/dev/null 2>&1 || return 1
+  # /boot is often root-readable only. lsinitrd can also exit non-zero while
+  # still printing useful contents (pipefail would false-negative), so capture
+  # output and ignore its status.
+  local listing=""
+  listing="$(sudo lsinitrd 2>/dev/null || true)"
+  if [[ -z "${listing}" ]]; then
+    listing="$(lsinitrd 2>/dev/null || true)"
+  fi
+  [[ -n "${listing}" ]] || return 1
+  grep -qE 'tpm2-tss|libcryptsetup-token-systemd-tpm2\.so' <<<"${listing}"
+}
+
+has_initramfs_etc_overlay() {
+  command -v rpm-ostree >/dev/null 2>&1 || return 1
+  rpm-ostree status 2>/dev/null | grep -q 'InitramfsEtc:'
+}
+
+ensure_initramfs_tpm2() {
+  if initramfs_has_tpm2; then
+    printf 'Initramfs already includes TPM2 unlock support (tpm2-tss).\n'
+    return
+  fi
+
+  if ! command -v rpm-ostree >/dev/null 2>&1; then
+    die "tpm2-tss missing from initramfs and rpm-ostree not found; add it with dracut on traditional Fedora"
+  fi
+
+  # rpm-ostree refuses: initramfs --enable + existing initramfs-etc overlay.
+  if has_initramfs_etc_overlay; then
+    cat >&2 <<'EOF'
+error: initramfs lacks TPM2 support, but this system already uses
+       rpm-ostree initramfs-etc (e.g. /etc/vconsole.conf).
+
+       That conflicts with: rpm-ostree initramfs --enable --arg=--force-add ...
+
+       Options:
+         1) Prefer a Fedora image that already ships tpm2-tss in the initramfs
+         2) Or drop initramfs-etc tracking, enable initramfs regen, then re-track:
+              sudo rpm-ostree initramfs-etc --untrack /etc/vconsole.conf
+              sudo rpm-ostree initramfs --enable --arg=--force-add --arg=tpm2-tss
+              sudo rpm-ostree initramfs-etc --track /etc/vconsole.conf
+EOF
+    exit 1
+  fi
+
+  printf 'Adding tpm2-tss to initramfs via rpm-ostree (needed for unlock at boot)...\n'
+  sudo rpm-ostree initramfs --enable --arg=--force-add --arg=tpm2-tss
+  printf 'Staged. A reboot is required before TPM unlock works in early boot.\n'
+}
+
+crypttab_path() {
+  printf '%s\n' /etc/crypttab
+}
+
+ensure_crypttab_tpm2() {
+  local device="$1"
+  local uuid crypttab
+  uuid="$(sudo cryptsetup luksUUID "${device}")"
+  crypttab="$(crypttab_path)"
+  [[ -f "${crypttab}" ]] || die "missing ${crypttab}"
+
+  local tmp line_no
+  tmp="$(mktemp)"
+  sudo cp "${crypttab}" "${tmp}"
+  sudo chown "${USER}:${USER}" "${tmp}"
+  chmod 600 "${tmp}"
+
+  if ! grep -E "UUID=${uuid}|luks-${uuid}" "${tmp}" >/dev/null; then
+    printf 'Note: no /etc/crypttab line matched UUID=%s; relying on kernel cmdline / LUKS token only.\n' "${uuid}"
+    rm -f "${tmp}"
+    return
+  fi
+
+  line_no="$(grep -nE "UUID=${uuid}|luks-${uuid}" "${tmp}" | head -n1 | cut -d: -f1)"
+  local line
+  line="$(sed -n "${line_no}p" "${tmp}")"
+
+  if grep -Eq '(^|[[:space:],])tpm2-device=' <<<"${line}"; then
+    printf 'crypttab already references tpm2-device for this volume.\n'
+    rm -f "${tmp}"
+    return
+  fi
+
+  # Append tpm2-device=auto to the options field (4th column), creating it if absent.
+  local name src key opts
+  name="$(awk '{print $1}' <<<"${line}")"
+  src="$(awk '{print $2}' <<<"${line}")"
+  key="$(awk '{print $3}' <<<"${line}")"
+  opts="$(awk '{print $4}' <<<"${line}")"
+  [[ -n "${key}" ]] || key="none"
+  if [[ -n "${opts}" ]]; then
+    opts="${opts},tpm2-device=auto"
+  else
+    opts="tpm2-device=auto"
+  fi
+
+  local new_line="${name} ${src} ${key} ${opts}"
+  sed -i "${line_no}c\\${new_line}" "${tmp}"
+  sudo cp "${tmp}" "${crypttab}"
+  sudo chmod 600 "${crypttab}"
+  rm -f "${tmp}"
+  printf 'Updated %s options: %s\n' "${crypttab}" "${opts}"
+}
+
+enroll_tpm() {
+  local device="$1"
+  local pcrs="$2"
+
+  printf 'Current LUKS slots / tokens:\n'
+  sudo systemd-cryptenroll "${device}" || true
+  printf '\n'
+
+  printf 'Enrolling TPM2 (pcrs=%s). Enter the existing LUKS passphrase when asked.\n' "${pcrs}"
+  # Wipe any previous TPM2 enrollment, then bind a fresh one.
+  sudo systemd-cryptenroll \
+    --wipe-slot=tpm2 \
+    --tpm2-device=auto \
+    --tpm2-pcrs="${pcrs}" \
+    "${device}"
+
+  printf '\nAfter enrollment:\n'
+  sudo systemd-cryptenroll "${device}"
+}
+
+unenroll_tpm() {
+  local device="$1"
+  printf 'Removing TPM2 unlock from %s\n' "${device}"
+  sudo systemd-cryptenroll --wipe-slot=tpm2 "${device}"
+  printf '\nRemaining slots / tokens:\n'
+  sudo systemd-cryptenroll "${device}"
+}
+
+main() {
+  local unenroll=0
+  local pcrs="${DEFAULT_PCRS}"
+  local -a pos=()
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --unenroll)
+        unenroll=1
+        shift
+        ;;
+      --pcrs)
+        [[ "${#}" -ge 2 ]] || die "--pcrs requires a value"
+        pcrs="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        pos+=("$@")
+        break
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        pos+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  ((${#pos[@]} <= 1)) || { usage >&2; exit 1; }
+
+  need_cmd sudo
+  need_cmd systemd-cryptenroll
+  need_cmd cryptsetup
+  need_cmd lsblk
+
+  ensure_tpm_present
+
+  local device
+  device="$(resolve_device "${pos[0]:-}")"
+
+  if ((unenroll)); then
+    unenroll_tpm "${device}"
+    printf '\nOK: TPM unlock removed. Passphrase unlock still works.\n'
+    exit 0
+  fi
+
+  ensure_initramfs_tpm2
+  ensure_crypttab_tpm2 "${device}"
+  enroll_tpm "${device}" "${pcrs}"
+
+  printf '\nOK: TPM unlock enrolled for %s\n' "${device}"
+  printf '  PCRs     : %s\n' "${pcrs}"
+  printf '  Fallback : your LUKS passphrase still works if TPM unlock fails\n'
+  printf '  Re-enroll: after firmware/Secure Boot policy changes, run this script again\n'
+  printf '\nReboot once to confirm the password prompt is skipped.\n'
+}
+
+main "$@"

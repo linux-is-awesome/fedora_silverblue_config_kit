@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Backup a LUKS encryption header to a directory you choose.
+# Run on the host — needs sudo for cryptsetup device access.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: backup-luks-header <backup-dir> [device]
+
+  backup-dir  Directory where the header image and .sha256 will be written
+  device      Optional LUKS block device (e.g. /dev/nvme0n1p4).
+              If omitted, lists LUKS devices and asks you to pick one.
+
+Examples:
+  backup-luks-header /run/media/$USER/External/Backups
+  backup-luks-header /mnt/backups /dev/nvme0n1p4
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+list_luks_candidates() {
+  # Print: path<TAB>size<TAB>disk-model
+  local name fstype size type pkname model
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    name="$(awk '{print $1}' <<<"${line}")"
+    fstype="$(awk '{print $2}' <<<"${line}")"
+    size="$(awk '{print $3}' <<<"${line}")"
+    type="$(awk '{print $4}' <<<"${line}")"
+    pkname="$(awk '{print $5}' <<<"${line}")"
+    [[ "${fstype}" == "crypto_LUKS" ]] || continue
+    [[ "${type}" == "part" || "${type}" == "disk" ]] || continue
+    model=""
+    if [[ -n "${pkname}" && -b "/dev/${pkname}" ]]; then
+      model="$(lsblk -dno MODEL "/dev/${pkname}" 2>/dev/null | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    elif [[ "${type}" == "disk" ]]; then
+      model="$(lsblk -dno MODEL "/dev/${name}" 2>/dev/null | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+    printf '%s\t%s\t%s\n' "/dev/${name}" "${size}" "${model:-}"
+  done < <(lsblk -rno NAME,FSTYPE,SIZE,TYPE,PKNAME)
+}
+
+resolve_device() {
+  local requested="${1:-}"
+  if [[ -n "${requested}" ]]; then
+    [[ -b "${requested}" ]] || die "not a block device: ${requested}"
+    sudo cryptsetup isLuks "${requested}" \
+      || die "not a LUKS device: ${requested}"
+    printf '%s\n' "${requested}"
+    return
+  fi
+
+  [[ -t 0 ]] || die "no device given; pass one as the second argument (stdin is not a TTY)"
+
+  local -a devices=() sizes=() models=()
+  local path size model
+  while IFS=$'\t' read -r path size model; do
+    [[ -n "${path}" ]] || continue
+    devices+=("${path}")
+    sizes+=("${size}")
+    models+=("${model}")
+  done < <(list_luks_candidates)
+
+  ((${#devices[@]} > 0)) || die "no LUKS devices found"
+
+  printf 'Select LUKS device to back up:\n' >&2
+  local i
+  for i in "${!devices[@]}"; do
+    printf '  %d) %s  (%s' "$((i + 1))" "${devices[$i]}" "${sizes[$i]}" >&2
+    if [[ -n "${models[$i]}" ]]; then
+      printf ', %s' "${models[$i]}" >&2
+    fi
+    printf ')\n' >&2
+  done
+
+  local choice
+  while true; do
+    printf 'Enter number [1-%d]: ' "${#devices[@]}" >&2
+    read -r choice
+    if [[ "${choice}" =~ ^[0-9]+$ ]] \
+      && ((choice >= 1 && choice <= ${#devices[@]})); then
+      printf '%s\n' "${devices[$((choice - 1))]}"
+      return
+    fi
+    printf 'Invalid selection.\n' >&2
+  done
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  [[ "${#}" -ge 1 ]] || { usage >&2; exit 1; }
+
+  need_cmd cryptsetup
+  need_cmd sudo
+  need_cmd sha256sum
+  need_cmd date
+  need_cmd lsblk
+
+  local backup_dir device
+  backup_dir="$(readlink -f -- "${1}")"
+  device="$(resolve_device "${2:-}")"
+
+  [[ -d "${backup_dir}" ]] || die "backup directory missing: ${backup_dir}"
+  [[ -w "${backup_dir}" ]] || die "backup directory not writable: ${backup_dir}"
+
+  local uuid
+  uuid="$(sudo cryptsetup luksUUID "${device}")"
+  [[ -n "${uuid}" ]] || die "could not read LUKS UUID from ${device}"
+
+  local stamp dest checksum
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="${backup_dir}/luks-header-${uuid}-${stamp}.img"
+  checksum="${dest}.sha256"
+
+  [[ ! -e "${dest}" ]] || die "refusing to overwrite existing file: ${dest}"
+
+  printf 'Backing up LUKS header\n'
+  printf '  device : %s\n' "${device}"
+  printf '  uuid   : %s\n' "${uuid}"
+  printf '  output : %s\n' "${dest}"
+
+  # Header backup does not need the passphrase; root is required to read the device.
+  sudo cryptsetup luksHeaderBackup "${device}" --header-backup-file "${dest}"
+  sudo chown "${USER}:${USER}" "${dest}"
+  chmod 600 "${dest}"
+
+  cryptsetup isLuks "${dest}" \
+    || die "backup written but cryptsetup does not recognize it as LUKS: ${dest}"
+
+  local backed_uuid
+  backed_uuid="$(cryptsetup luksUUID "${dest}")"
+  [[ "${backed_uuid}" == "${uuid}" ]] \
+    || die "UUID mismatch: device=${uuid} backup=${backed_uuid}"
+
+  sha256sum "${dest}" >"${checksum}"
+  chmod 600 "${checksum}"
+
+  printf 'OK\n'
+  printf '  header   : %s (%s bytes)\n' "${dest}" "$(stat -c '%s' "${dest}")"
+  printf '  checksum : %s\n' "${checksum}"
+  printf '  sha256   : %s\n' "$(cut -d' ' -f1 "${checksum}")"
+  printf '\nStore this file offline and separate from the passphrase.\n'
+  printf 'Restore (destructive — only when recovering a damaged header):\n'
+  printf '  sudo cryptsetup luksHeaderRestore %s --header-backup-file %s\n' \
+    "${device}" "${dest}"
+}
+
+main "$@"

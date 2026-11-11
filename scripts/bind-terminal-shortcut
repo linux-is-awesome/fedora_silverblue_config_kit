@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Ctrl+Alt+T → xdg-terminal-exec (FreeDesktop / GNOME default terminal).
+#
+# Uses the desktop entry's new-window action so a second press opens another
+# window instead of silently activating the already-running app (Ptyxis/GApplication).
+set -euo pipefail
+
+XDG_TERMINALS_LIST="${XDG_CONFIG_HOME:-${HOME}/.config}/xdg-terminals.list"
+
+usage() {
+  cat <<'EOF'
+Usage: bind-terminal-shortcut
+
+  Binds Ctrl+Alt+T to: xdg-terminal-exec
+
+  If xdg-terminal-exec is missing, layers it with rpm-ostree (needs reboot
+  before the binary exists).
+
+  Writes ~/.config/xdg-terminals.list so the default terminal is launched
+  via its new-window action (required for Ptyxis when already open).
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+ensure_xdg_terminal_exec() {
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    return 0
+  fi
+
+  command -v rpm-ostree >/dev/null 2>&1 || die "xdg-terminal-exec missing and rpm-ostree not found"
+
+  printf 'xdg-terminal-exec not installed; layering with rpm-ostree...\n'
+  as_root rpm-ostree install -y xdg-terminal-exec
+
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nLayered xdg-terminal-exec. Reboot, then the shortcut will work.\n'
+  printf 'Binding the shortcut now so it is ready after reboot.\n'
+}
+
+# Prefer default GNOME terminals with an explicit new-window action.
+configure_new_window() {
+  mkdir -p "$(dirname -- "${XDG_TERMINALS_LIST}")"
+  cat >"${XDG_TERMINALS_LIST}" <<'EOF'
+# Used by xdg-terminal-exec (Ctrl+Alt+T). Prefer new-window so a running
+# terminal gets another window instead of a no-op activate.
+org.gnome.Ptyxis.desktop:new-window
+org.gnome.Console.desktop:new-window
+org.gnome.Terminal.desktop:new-window
+EOF
+  printf 'Wrote %s\n' "${XDG_TERMINALS_LIST}"
+}
+
+bind_shortcut() {
+  local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
+  gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['${path}']"
+  gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" name "Terminal"
+  gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" command "xdg-terminal-exec"
+  gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${path}" binding "<Control><Alt>t"
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  command -v gsettings >/dev/null 2>&1 || die "gsettings not found"
+
+  ensure_xdg_terminal_exec
+  configure_new_window
+  bind_shortcut
+
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    printf 'OK: Ctrl+Alt+T → %s\n' "$(xdg-terminal-exec --print-cmd | tr '\n' ' ')"
+  else
+    printf 'OK: shortcut bound to xdg-terminal-exec (reboot required for the binary)\n'
+  fi
+}
+
+main "$@"

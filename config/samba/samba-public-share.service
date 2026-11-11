@@ -1,0 +1,14 @@
+[Unit]
+Description=Samba Public folder share (follows GNOME File Sharing)
+Documentation=https://help.gnome.org/gnome-help/sharing-personal.html
+BindsTo=gnome-user-share-webdav.service
+After=gnome-user-share-webdav.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/samba-public-share/share-on %h/Public
+ExecStop=/usr/local/lib/samba-public-share/share-off %h/Public
+
+[Install]
+WantedBy=gnome-user-share-webdav.service

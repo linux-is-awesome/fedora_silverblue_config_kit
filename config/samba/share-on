@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Create a Samba usershare for a directory (guest OK, full ACL).
+# Usage: share-on PATH [SHARE_NAME]
+set -euo pipefail
+
+[[ "${#}" -ge 1 ]] || {
+  printf 'usage: %s PATH [SHARE_NAME]\n' "$(basename -- "$0")" >&2
+  exit 2
+}
+
+path="$(readlink -f -- "$1")"
+[[ -d "${path}" ]] || {
+  printf 'error: not a directory: %s\n' "$1" >&2
+  exit 1
+}
+
+name="${2:-$(basename -- "${path}")}"
+# Samba share names: keep it simple (basename is usually enough).
+name="${name// /_}"
+
+chmod a+rwx "${path}" 2>/dev/null || true
+
+net usershare delete "${name}" >/dev/null 2>&1 || true
+net usershare add "${name}" "${path}" "${name}" everyone:F guest_ok=y

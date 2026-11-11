@@ -1,0 +1,13 @@
+[Unit]
+Description=Grant nethogs capabilities for per-process network monitoring
+After=local-fs.target
+ConditionPathExists=|/usr/sbin/nethogs
+ConditionPathExists=|/usr/bin/nethogs
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for p in /usr/sbin/nethogs /usr/bin/nethogs; do [[ -x "$p" ]] || continue; /usr/sbin/setcap cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+ep "$p"; exit 0; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Install DejaVu fonts system-wide (visible to GDM and bind-mounted into the work container).
+# Matches Ubuntu's default fontconfig monospace prefer (DejaVu Sans Mono first).
+set -euo pipefail
+
+DEJAVU_URL="${DEJAVU_URL:-https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip}"
+DEFAULT_SYSTEM_DIR="/usr/local/share/fonts/dejavu"
+
+usage() {
+  cat <<'EOF'
+Usage: install-dejavu-fonts [--system|--user] [--dir DIR]
+
+  Installs DejaVu TTF fonts (including DejaVu Sans Mono).
+
+  --system   Install to /usr/local/share/fonts/dejavu (default; needs sudo; GDM can use)
+  --user     Install to ~/.local/share/fonts/dejavu (current user only; GDM cannot use)
+  --dir DIR  Install to DIR instead
+
+Environment:
+  DEJAVU_URL   Override zip URL
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+USE_SUDO=0
+
+as_root() {
+  if ((USE_SUDO)); then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+main() {
+  local dest="" mode="system"
+
+  while [[ "${#}" -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --user) mode="user"; shift ;;
+      --system) mode="system"; shift ;;
+      --dir)
+        [[ "${#}" -ge 2 ]] || die "--dir requires a path"
+        dest="$2"
+        mode="custom"
+        shift 2
+        ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  need_cmd curl
+  need_cmd unzip
+  need_cmd fc-cache
+  need_cmd find
+  need_cmd mktemp
+
+  case "${mode}" in
+    user) dest="${HOME}/.local/share/fonts/dejavu" ;;
+    system) dest="${DEFAULT_SYSTEM_DIR}" ;;
+    custom) [[ -n "${dest}" ]] || die "empty --dir" ;;
+  esac
+
+  local parent
+  parent="$(dirname -- "${dest}")"
+  if [[ ! -d "${dest}" ]]; then
+    if [[ -w "${parent}" ]] || mkdir -p "${dest}" 2>/dev/null; then
+      :
+    else
+      USE_SUDO=1
+    fi
+  elif [[ ! -w "${dest}" ]]; then
+    USE_SUDO=1
+  fi
+  if ((USE_SUDO)); then
+    need_cmd sudo
+  fi
+
+  local tmp
+  tmp="$(mktemp -d)"
+  trap "rm -rf $(printf '%q' "${tmp}")" EXIT
+
+  printf 'Downloading %s\n' "${DEJAVU_URL}"
+  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/dejavu.zip" "${DEJAVU_URL}"
+  unzip -q -o "${tmp}/dejavu.zip" -d "${tmp}/extract"
+
+  local -a fonts=()
+  mapfile -t fonts < <(
+    find "${tmp}/extract" -type f -iname 'DejaVu*.ttf' ! -path '*/__MACOSX/*' | sort
+  )
+  ((${#fonts[@]} > 0)) || die "no DejaVu TTF files found in archive"
+
+  as_root mkdir -p "${dest}"
+  as_root find "${dest}" -maxdepth 1 -type f -iname '*.ttf' -delete
+
+  local f
+  for f in "${fonts[@]}"; do
+    as_root install -m 644 "${f}" "${dest}/"
+  done
+
+  printf 'Refreshing font cache...\n'
+  as_root fc-cache -f "${dest}" >/dev/null
+
+  printf '\nOK: DejaVu fonts installed under %s (%d files)\n' "${dest}" "${#fonts[@]}"
+  fc-list "DejaVu Sans Mono" file family 2>/dev/null | sed 's/^/  /' || true
+  printf 'Run configure-ubuntu-fonts so monospace prefers DejaVu Sans Mono (Ubuntu-like).\n'
+}
+
+main "$@"

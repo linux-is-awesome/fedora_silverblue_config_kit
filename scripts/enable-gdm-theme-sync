@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Install live GDM + system GTK theme/icon sync (systemd path unit).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../config/theme-sync"
+LIB_DST="${LIB_DST:-/usr/local/lib/theme-sync}"
+STATE_DIR="${STATE_DIR:-/var/lib/theme-sync}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+UNIT_NAME="gdm-theme-sync"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-gdm-theme-sync [--undo]
+
+  Installs a systemd path/service that, after an admin user logs in, mirrors
+  gtk-theme / icon-theme / font / cursor / color-scheme / accent into:
+    - /etc/dconf/db/gdm.d/50-gdm-theme-sync  (GDM greeter)
+    - /etc/gtk-{3,4}.0/settings.ini          (system GTK apps via /var/lib/theme-sync)
+
+  Themes/icons are resolved from /usr/local/share and /usr/share (Silverblue-safe).
+  Requires the user to be in wheel, sudo, or admin.
+
+  --undo   Disable units and remove installed files for this feature.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_files() {
+  local f
+  for f in common.sh gdm-theme-sync update-gtk-settings-symlinks; do
+    [[ -f "${SRC_DIR}/${f}" ]] || die "missing ${SRC_DIR}/${f}"
+  done
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.service" ]] || die "missing unit files"
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.path" ]] || die "missing path unit"
+
+  as_root install -d -m 755 "${LIB_DST}" "${STATE_DIR}" "${UNIT_DIR}"
+  as_root install -m 644 "${SRC_DIR}/common.sh" "${LIB_DST}/common.sh"
+  as_root install -m 755 "${SRC_DIR}/gdm-theme-sync" "${LIB_DST}/gdm-theme-sync"
+  as_root install -m 755 "${SRC_DIR}/update-gtk-settings-symlinks" \
+    "${LIB_DST}/update-gtk-settings-symlinks"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.service" "${UNIT_DIR}/${UNIT_NAME}.service"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.path" "${UNIT_DIR}/${UNIT_NAME}.path"
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "${UNIT_NAME}.path"
+  # Restart (not start): pick up newly installed script if the service was already running.
+  as_root systemctl restart "${UNIT_NAME}.service"
+
+  printf 'Enabled %s.path and restarted %s.service\n' "${UNIT_NAME}" "${UNIT_NAME}"
+  printf 'Theme/icon changes sync to GDM after login (admin user).\n'
+  printf 'Also covers system GTK apps via %s → /etc/gtk-*/settings.ini\n' "${STATE_DIR}"
+}
+
+undo() {
+  as_root systemctl disable --now "${UNIT_NAME}.path" 2>/dev/null || true
+  as_root systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+  as_root rm -f \
+    "${UNIT_DIR}/${UNIT_NAME}.path" \
+    "${UNIT_DIR}/${UNIT_NAME}.service" \
+    "${LIB_DST}/gdm-theme-sync"
+  # Keep common.sh / update-symlinks if adw sync still installed.
+  if [[ ! -e "${LIB_DST}/adw-gtk3-theme-sync" ]]; then
+    as_root rm -f \
+      "${LIB_DST}/common.sh" \
+      "${LIB_DST}/update-gtk-settings-symlinks"
+    as_root rmdir "${LIB_DST}" 2>/dev/null || true
+  fi
+  as_root rm -f /etc/dconf/db/gdm.d/50-gdm-theme-sync
+  as_root dconf update 2>/dev/null || true
+  # Remove GTK symlinks only if they point at our state.
+  local link target
+  for link in /etc/gtk-3.0/settings.ini /etc/gtk-4.0/settings.ini; do
+    if [[ -L "${link}" ]]; then
+      target="$(readlink "${link}" || true)"
+      if [[ "${target}" == "${STATE_DIR}"/* ]]; then
+        as_root rm -f "${link}"
+      fi
+    fi
+  done
+  as_root rm -rf "${STATE_DIR}/gtk-3.0" "${STATE_DIR}/gtk-4.0"
+  as_root rmdir "${STATE_DIR}" 2>/dev/null || true
+  as_root systemctl daemon-reload
+  printf 'Removed %s\n' "${UNIT_NAME}"
+}
+
+main() {
+  need_cmd sudo
+  need_cmd systemctl
+
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --undo)
+      undo
+      ;;
+    "")
+      install_files
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

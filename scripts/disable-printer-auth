@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Allow printer configuration without a password prompt (polkit).
+#
+# GNOME Settings / system-config-printer use cups-pk-helper, which defaults
+# to auth_admin. This installs a polkit rule so wheel-group users can manage
+# printers without authenticating.
+set -euo pipefail
+
+RULE_DST="${RULE_DST:-/etc/polkit-1/rules.d/49-nopasswd-cups.rules}"
+GROUP="${GROUP:-wheel}"
+
+usage() {
+  cat <<'EOF'
+Usage: disable-printer-auth [--undo]
+
+  Installs a polkit rule so members of group "wheel" can configure printers
+  (cups-pk-helper) without a password prompt.
+
+  --undo   Remove the rule and restore password prompts.
+
+Requires pkexec/sudo. Takes effect immediately for new polkit checks.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_rule() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"${tmp}" <<EOF
+// Installed by fedora_silverblue_config/scripts/disable-printer-auth
+// Allow ${GROUP} to manage printers via cups-pk-helper without a password.
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.opensuse.cupspkhelper.mechanism.") === 0 &&
+        subject.isInGroup("${GROUP}")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+  as_root install -d -m 755 "$(dirname -- "${RULE_DST}")"
+  as_root install -m 644 "${tmp}" "${RULE_DST}"
+  rm -f "${tmp}"
+  printf 'Installed %s\n' "${RULE_DST}"
+  printf 'Members of group "%s" can configure printers without a password.\n' "${GROUP}"
+}
+
+remove_rule() {
+  if [[ -f "${RULE_DST}" ]]; then
+    as_root rm -f "${RULE_DST}"
+    printf 'Removed %s\n' "${RULE_DST}"
+  else
+    printf 'No rule at %s\n' "${RULE_DST}"
+  fi
+}
+
+main() {
+  local undo=0
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --undo)
+      undo=1
+      shift
+      ;;
+    "")
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+  [[ "${#}" -eq 0 ]] || { usage >&2; exit 1; }
+
+  if ((undo)); then
+    remove_rule
+  else
+    install_rule
+  fi
+}
+
+main "$@"
