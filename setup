@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive menu to run Fedora Silverblue config scripts in this project.
+# Interactive menu for Fedora Silverblue Config Kit.
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -84,7 +84,7 @@ build_action_index() {
 
 print_header() {
   clear 2>/dev/null || true
-  printf '%s%sFedora Silverblue config%s\n' "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
+  printf '%s%sFedora Silverblue Config Kit%s\n' "${C_BOLD}" "${C_CYAN}" "${C_RESET}"
   printf '%s%s%s\n\n' "${C_DIM}" "${ROOT}" "${C_RESET}"
 }
 
