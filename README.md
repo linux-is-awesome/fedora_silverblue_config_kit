@@ -5,8 +5,8 @@ Shell scripts that set up a fresh Fedora Silverblue desktop: fonts, themes, pack
 ## Usage
 
 ```bash
-git clone https://github.com/linux-is-awesome/fedora-silverblue-config-kit.git
-cd fedora-silverblue-config-kit
+git clone https://github.com/linux-is-awesome/fedora_silverblue_config_kit.git
+cd fedora_silverblue_config_kit
 ./setup
 ```
 
