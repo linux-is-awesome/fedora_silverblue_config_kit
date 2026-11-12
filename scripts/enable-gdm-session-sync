@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Install live GDM session sync (dconf + monitors.xml watchers).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../lib/gdm-session-sync"
+LIB_DST="${LIB_DST:-/usr/local/lib/gdm-session-sync}"
+CONF_DIR="${CONF_DIR:-/etc/gdm-session-sync}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+UNIT_NAME="gdm-session-sync"
+INOTIFY_PKG="inotify-tools"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-gdm-session-sync [--undo]
+
+  Installs a systemd path/service that, while the configured user is logged in:
+    - watches dconf for session settings → GDM dconf DB
+    - watches monitors.xml (inotify) → GDM home + /etc/xdg
+
+  Runs one full sync at install time. After that, only change events sync.
+  Does not use gdm ExecStartPre or logout hooks.
+
+  Requires inotifywait (inotify-tools); layers via rpm-ostree if missing.
+
+  Does not manage system GTK settings.ini — use enable-desktop-theme-sync.
+
+  --undo   Remove units and installed files.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+target_user() {
+  if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != root ]]; then
+    printf '%s\n' "${SUDO_USER}"
+  else
+    printf '%s\n' "${USER}"
+  fi
+}
+
+ensure_inotify_tools() {
+  if command -v inotifywait >/dev/null 2>&1; then
+    return 0
+  fi
+
+  need_cmd rpm-ostree
+  need_cmd rpm
+
+  if rpm -q "${INOTIFY_PKG}" >/dev/null 2>&1; then
+    die "inotifywait missing but ${INOTIFY_PKG} is installed — check PATH"
+  fi
+
+  printf 'inotifywait not found; layering %s via rpm-ostree...\n' "${INOTIFY_PKG}"
+  as_root rpm-ostree install "${INOTIFY_PKG}"
+
+  if command -v inotifywait >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nQueued %s. Reboot, then re-run: %s\n' \
+    "${INOTIFY_PKG}" "$(basename -- "$0")"
+  exit 0
+}
+
+install_files() {
+  local user
+  user="$(target_user)"
+  id "${user}" &>/dev/null || die "cannot resolve target user"
+
+  need_cmd dconf
+  ensure_inotify_tools
+
+  [[ -f "${SRC_DIR}/common.sh" ]] || die "missing ${SRC_DIR}/common.sh"
+  [[ -f "${SRC_DIR}/gdm-session-sync" ]] || die "missing ${SRC_DIR}/gdm-session-sync"
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.service" ]] || die "missing ${SRC_DIR}/${UNIT_NAME}.service"
+  [[ -f "${SRC_DIR}/${UNIT_NAME}.path" ]] || die "missing ${SRC_DIR}/${UNIT_NAME}.path"
+
+  as_root install -d -m 755 "${LIB_DST}" "${CONF_DIR}" "${UNIT_DIR}"
+  as_root install -m 644 "${SRC_DIR}/common.sh" "${LIB_DST}/common.sh"
+  as_root install -m 755 "${SRC_DIR}/gdm-session-sync" "${LIB_DST}/gdm-session-sync"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.service" "${UNIT_DIR}/${UNIT_NAME}.service"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.path" "${UNIT_DIR}/${UNIT_NAME}.path"
+  printf '%s\n' "${user}" | as_root tee "${CONF_DIR}/user" >/dev/null
+  as_root chmod 644 "${CONF_DIR}/user"
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "${UNIT_NAME}.path"
+  as_root systemctl restart "${UNIT_NAME}.service"
+
+  as_root "${LIB_DST}/gdm-session-sync" --once --user "${user}"
+
+  printf 'Enabled %s.path and restarted %s.service\n' "${UNIT_NAME}" "${UNIT_NAME}"
+  printf 'Initial sync done for %s; further syncs only on settings/monitors changes.\n' "${user}"
+}
+
+undo() {
+  as_root systemctl disable --now "${UNIT_NAME}.path" 2>/dev/null || true
+  as_root systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+  as_root rm -f \
+    "${UNIT_DIR}/${UNIT_NAME}.path" \
+    "${UNIT_DIR}/${UNIT_NAME}.service" \
+    "${LIB_DST}/gdm-session-sync" \
+    "${LIB_DST}/common.sh" \
+    /etc/dconf/db/gdm.d/90-gdm-session-sync
+  as_root rmdir "${LIB_DST}" 2>/dev/null || true
+  as_root rm -rf "${CONF_DIR}"
+  as_root dconf compile /etc/dconf/db/gdm /etc/dconf/db/gdm.d 2>/dev/null || true
+  as_root systemctl daemon-reload
+  printf 'Removed gdm-session-sync\n'
+}
+
+main() {
+  need_cmd sudo
+  need_cmd systemctl
+
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --undo) undo ;;
+    "") install_files ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

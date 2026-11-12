@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync desktop GTK theme (adw light/dark + system settings.ini)
+After=accounts-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/desktop-theme-sync/desktop-theme-sync
+Restart=on-failure
+RestartSec=2

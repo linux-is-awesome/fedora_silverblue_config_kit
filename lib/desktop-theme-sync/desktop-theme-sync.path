@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch for user session start (adw-gtk3 theme sync)
+Description=Watch for user session start (desktop theme sync)
 
 [Path]
 PathChanged=/run/user/

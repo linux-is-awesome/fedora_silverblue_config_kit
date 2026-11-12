@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Live desktop theme handler: adw-gtk3 light/dark + system GTK settings.ini.
+# Does not write GDM — greeter sync is gdm-session-sync.
+set -euo pipefail
+
+LIB_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${LIB_DIR}/common.sh"
+
+STATE_DIR="${STATE_DIR:-/var/lib/desktop-theme-sync}"
+GTK3_INI_PATH="${GTK3_INI_PATH:-${STATE_DIR}/gtk-3.0/settings.ini}"
+GTK4_INI_PATH="${GTK4_INI_PATH:-${STATE_DIR}/gtk-4.0/settings.ini}"
+UPDATE_SYMLINKS="${UPDATE_SYMLINKS:-${LIB_DIR}/update-gtk-settings-symlinks}"
+
+update_symlinks() {
+  STATE_DIR="${STATE_DIR}" "${UPDATE_SYMLINKS}"
+}
+
+set_theme_variant() {
+  local user="$1" theme="$2" current="$3"
+  [[ -z "${theme}" || "${theme}" == "${current}" ]] && return 0
+  theme_exists gtk-theme "${theme}" || return 0
+  as_user "${user}" gsettings set org.gnome.desktop.interface gtk-theme "${theme}" 2>/dev/null || true
+}
+
+adjust_theme_for_colorscheme() {
+  local user="$1" color_scheme gtk_theme
+
+  color_scheme="$(get_user_gsettings "${user}" color-scheme)" || return 0
+  gtk_theme="$(get_user_gsettings "${user}" gtk-theme)" || return 0
+
+  color_scheme="$(unquote_gvariant "${color_scheme}")"
+  gtk_theme="$(unquote_gvariant "${gtk_theme}")"
+
+  case "${color_scheme}" in
+    prefer-dark)
+      set_theme_variant "${user}" "${gtk_theme}-dark" "${gtk_theme}"
+      ;;
+    default|prefer-light)
+      set_theme_variant "${user}" "${gtk_theme%-dark}" "${gtk_theme}"
+      ;;
+  esac
+}
+
+write_settings_ini() {
+  local user="$1"
+  local gtk_raw icon_raw font_raw cursor_raw color_scheme
+  local gtk_name icon_name cursor_name font_name
+  local tmp path scheme
+
+  gtk_raw="$(get_user_gsettings "${user}" gtk-theme)" || return 0
+  icon_raw="$(get_user_gsettings "${user}" icon-theme)" || return 0
+  font_raw="$(get_user_gsettings "${user}" font-name)" || return 0
+  cursor_raw="$(get_user_gsettings "${user}" cursor-theme)" || return 0
+  color_scheme="$(get_user_gsettings "${user}" color-scheme)" || return 0
+
+  gtk_name="$(resolve_theme_name gtk-theme "${gtk_raw}" || true)"
+  icon_name="$(resolve_theme_name icon-theme "${icon_raw}" || true)"
+  cursor_name="$(resolve_theme_name cursor-theme "${cursor_raw}" || true)"
+  font_name="$(unquote_gvariant "${font_raw}")"
+
+  case "${color_scheme}" in
+    *prefer-dark*|*dark*) scheme=1 ;;
+    *) scheme=0 ;;
+  esac
+
+  for path in "${GTK3_INI_PATH}" "${GTK4_INI_PATH}"; do
+    tmp="$(mktemp)"
+    {
+      printf '%s\n' '[Settings]'
+      [[ -n "${gtk_name}" ]] && printf 'gtk-theme-name=%s\n' "${gtk_name}"
+      [[ -n "${icon_name}" ]] && printf 'gtk-icon-theme-name=%s\n' "${icon_name}"
+      [[ -n "${font_name}" ]] && printf 'gtk-font-name=%s\n' "${font_name}"
+      [[ -n "${cursor_name}" ]] && printf 'gtk-cursor-theme-name=%s\n' "${cursor_name}"
+      printf 'gtk-application-prefer-dark-theme=%s\n' "${scheme}"
+    } >"${tmp}"
+    if ! cmp -s "${tmp}" "${path}" 2>/dev/null; then
+      mkdir -p "$(dirname -- "${path}")"
+      install -m 0644 "${tmp}" "${path}"
+    fi
+    rm -f "${tmp}"
+  done
+
+  update_symlinks 2>/dev/null || true
+}
+
+sync_desktop_theme() {
+  local user="$1"
+  adjust_theme_for_colorscheme "${user}"
+  write_settings_ini "${user}"
+}
+
+is_theme_event() {
+  case "$1" in
+    */org/gnome/desktop/interface/gtk-theme* | \
+    */org/gnome/desktop/interface/icon-theme* | \
+    */org/gnome/desktop/interface/font-name* | \
+    */org/gnome/desktop/interface/cursor-theme* | \
+    */org/gnome/desktop/interface/color-scheme*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bootstrap_active_admin_user
+sync_desktop_theme "${active_user}"
+
+debounce_pid=""
+as_user "${active_user}" stdbuf -oL gdbus monitor --session \
+  --dest ca.desrt.dconf --object-path /ca/desrt/dconf/Writer/user 2>/dev/null \
+| while read -r line; do
+  is_theme_event "${line}" || continue
+  debounce_run debounce_pid sync_desktop_theme "${active_user}"
+done

@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch for user session start (GDM theme sync)
+Description=Watch for user session start (GDM session sync)
 
 [Path]
 PathChanged=/run/user/

@@ -54,9 +54,8 @@ MENU=(
   '@Appearance'
   'adw-gtk3|Install adw-gtk3 theme|adw-gtk3-theme (rpm-ostree) + Flatpak themes|install-adw-gtk3'
   'tela-icons|Install Tela icons|Tela icon theme system-wide + Flatpak access|install-tela-icons'
-  'sync-gdm|Sync settings to GDM|Monitors + fonts/theme from this session → login screen|sync-gdm-settings'
-  'gdm-theme-sync|Auto-sync theme to GDM|Live sync gtk/icons/fonts to greeter + system GTK|enable-gdm-theme-sync'
-  'adw-theme-sync|Auto adw-gtk3 light/dark|Sync gtk-theme to dark/light (adw-gtk3 ↔ adw-gtk3-dark)|enable-adw-gtk3-theme-sync'
+  'desktop-theme-sync|Desktop theme sync|adw light/dark + system GTK settings.ini|enable-desktop-theme-sync'
+  'gdm-session-sync|GDM session sync|On change: mirror session → login screen|enable-gdm-session-sync'
 
   '@Desktop & auth'
   'terminal-shortcut|Terminal shortcut|Ctrl+Alt+T → xdg-terminal-exec|bind-terminal-shortcut'

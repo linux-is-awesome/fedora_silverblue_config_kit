@@ -4,7 +4,7 @@
 #   - GNOME interface / document / monospace / titlebar fonts (Ubuntu Sans Mono via gsettings)
 #   - grayscale antialiasing + slight hinting
 #
-# GDM greeter: use scripts/sync-gdm-settings (monitors + desktop settings).
+# GDM greeter: use scripts/enable-gdm-session-sync.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +24,7 @@ Usage: configure-ubuntu-fonts
   Installs fontconfig rules and configures GNOME session fonts
   for an Ubuntu-like look.
 
-  For the login screen (GDM), including monitors: run sync-gdm-settings.
+  For the login screen (GDM), including monitors: enable-gdm-session-sync.
 
 Requires Ubuntu fonts already installed (see install-ubuntu-fonts).
 EOF
@@ -154,7 +154,7 @@ main() {
   print_status
 
   printf '\nOK: Ubuntu font look applied to this GNOME session.\n'
-  printf 'Sync login screen with: scripts/sync-gdm-settings\n'
+  printf 'Sync login screen with: scripts/enable-gdm-session-sync\n'
 }
 
 main "$@"

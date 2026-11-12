@@ -1,8 +1,25 @@
-# Shared helpers for theme-sync daemons (sourced, not executed).
+# Shared helpers for gdm-session-sync (sourced, not executed).
 # Distro-agnostic: wheel|sudo|admin, themes/icons under /usr/local and /usr/share.
 
-STATE_DIR="${STATE_DIR:-/var/lib/theme-sync}"
 USER_WAIT_TIMEOUT="${USER_WAIT_TIMEOUT:-60}"
+# Coalesce bursts of dconf/inotify events into one sync.
+DEBOUNCE_SECS="${DEBOUNCE_SECS:-0.5}"
+
+# debounce_run PID_VAR command [args...]
+# Restarts a sleep+command timer; only the last burst runs after DEBOUNCE_SECS.
+debounce_run() {
+  local -n _debounce_pid="$1"
+  shift
+  if [[ -n "${_debounce_pid:-}" ]] && kill -0 "${_debounce_pid}" 2>/dev/null; then
+    kill "${_debounce_pid}" 2>/dev/null || true
+    wait "${_debounce_pid}" 2>/dev/null || true
+  fi
+  (
+    sleep "${DEBOUNCE_SECS}"
+    "$@"
+  ) &
+  _debounce_pid=$!
+}
 
 find_active_user() {
   local sid active user class

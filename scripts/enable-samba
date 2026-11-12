@@ -3,8 +3,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SRC_DIR="${SCRIPT_DIR}/../config/samba"
-SRC_CONF="${SRC_DIR}/99-desktop-share.conf"
+CONF_DIR="${SCRIPT_DIR}/../config/samba"
+LIB_DIR="${SCRIPT_DIR}/../lib/samba-public-share"
+SRC_CONF="${CONF_DIR}/99-desktop-share.conf"
 SMB_CONF="${SMB_CONF:-/etc/samba/smb.conf}"
 DROPIN_DST="${DROPIN_DST:-/etc/samba/smb.conf.d/99-desktop-share.conf}"
 USERSHARES_DIR="${USERSHARES_DIR:-/var/lib/samba/usershares}"
@@ -285,8 +286,8 @@ install_gnome_sharing_sync() {
   [[ -n "${home}" && -d "${home}" ]] || die "home for ${user} not found"
   public="${home}/Public"
 
-  [[ -f "${SRC_DIR}/share-on" && -f "${SRC_DIR}/share-off" ]] || die "missing share helpers in ${SRC_DIR}"
-  [[ -f "${SRC_DIR}/samba-public-share.service" ]] || die "missing user unit"
+  [[ -f "${LIB_DIR}/share-on" && -f "${LIB_DIR}/share-off" ]] || die "missing share helpers in ${LIB_DIR}"
+  [[ -f "${LIB_DIR}/samba-public-share.service" ]] || die "missing user unit"
 
   if [[ ! -d "${public}" ]]; then
     as_root runuser -u "${user}" -- mkdir -p "${public}"
@@ -294,10 +295,10 @@ install_gnome_sharing_sync() {
   as_root chmod a+rwx "${public}"
 
   as_root install -d -m 755 "${SYNC_LIB_DST}"
-  as_root install -m 755 "${SRC_DIR}/share-on" "${SYNC_LIB_DST}/share-on"
-  as_root install -m 755 "${SRC_DIR}/share-off" "${SYNC_LIB_DST}/share-off"
+  as_root install -m 755 "${LIB_DIR}/share-on" "${SYNC_LIB_DST}/share-on"
+  as_root install -m 755 "${LIB_DIR}/share-off" "${SYNC_LIB_DST}/share-off"
   as_root install -d -m 755 "$(dirname -- "${USER_UNIT_DST}")"
-  as_root install -m 644 "${SRC_DIR}/samba-public-share.service" "${USER_UNIT_DST}"
+  as_root install -m 644 "${LIB_DIR}/samba-public-share.service" "${USER_UNIT_DST}"
 
   if [[ ! -d "/run/user/$(id -u "${user}")" ]]; then
     printf 'warning: %s has no session bus; enable %s after login:\n' "${user}" "${USER_UNIT_NAME}" >&2

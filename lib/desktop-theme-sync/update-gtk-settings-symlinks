@@ -2,7 +2,7 @@
 # Symlink watchdog-managed GTK settings into /etc for system GTK apps.
 set -eu
 
-STATE_DIR="${STATE_DIR:-/var/lib/theme-sync}"
+STATE_DIR="${STATE_DIR:-/var/lib/desktop-theme-sync}"
 GTK3_TARGET="${GTK3_TARGET:-/etc/gtk-3.0/settings.ini}"
 GTK4_TARGET="${GTK4_TARGET:-/etc/gtk-4.0/settings.ini}"
 

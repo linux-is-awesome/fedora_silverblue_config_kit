@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Install live desktop theme sync (adw light/dark + system GTK settings.ini).
+# Does not touch GDM — use enable-gdm-session-sync for the greeter.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="${SCRIPT_DIR}/../lib/desktop-theme-sync"
+LIB_DST="${LIB_DST:-/usr/local/lib/desktop-theme-sync}"
+STATE_DIR="${STATE_DIR:-/var/lib/desktop-theme-sync}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+UNIT_NAME="desktop-theme-sync"
+
+usage() {
+  cat <<'EOF'
+Usage: enable-desktop-theme-sync [--undo]
+
+  Installs a systemd path/service that, after an admin user logs in:
+    - switches gtk-theme light/dark with color-scheme (adw-gtk3 ↔ adw-gtk3-dark)
+    - writes system GTK settings.ini (/etc/gtk-{3,4}.0 via /var/lib/desktop-theme-sync)
+
+  Does not write GDM. Pair with enable-gdm-session-sync for the login screen.
+
+  --undo   Disable units and remove installed files for this feature.
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_files() {
+  local f
+  for f in common.sh desktop-theme-sync update-gtk-settings-symlinks \
+    desktop-theme-sync.service desktop-theme-sync.path; do
+    [[ -f "${SRC_DIR}/${f}" ]] || die "missing ${SRC_DIR}/${f}"
+  done
+
+  as_root install -d -m 755 "${LIB_DST}" "${STATE_DIR}" "${UNIT_DIR}"
+  as_root install -m 644 "${SRC_DIR}/common.sh" "${LIB_DST}/common.sh"
+  as_root install -m 755 "${SRC_DIR}/desktop-theme-sync" "${LIB_DST}/desktop-theme-sync"
+  as_root install -m 755 "${SRC_DIR}/update-gtk-settings-symlinks" \
+    "${LIB_DST}/update-gtk-settings-symlinks"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.service" "${UNIT_DIR}/${UNIT_NAME}.service"
+  as_root install -m 644 "${SRC_DIR}/${UNIT_NAME}.path" "${UNIT_DIR}/${UNIT_NAME}.path"
+
+  as_root systemctl daemon-reload
+  as_root systemctl enable --now "${UNIT_NAME}.path"
+  as_root systemctl restart "${UNIT_NAME}.service"
+
+  printf 'Enabled %s.path and restarted %s.service\n' "${UNIT_NAME}" "${UNIT_NAME}"
+  printf 'Desktop theme + system GTK settings.ini sync after admin login.\n'
+}
+
+undo() {
+  as_root systemctl disable --now "${UNIT_NAME}.path" 2>/dev/null || true
+  as_root systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+  as_root rm -f \
+    "${UNIT_DIR}/${UNIT_NAME}.path" \
+    "${UNIT_DIR}/${UNIT_NAME}.service" \
+    "${LIB_DST}/desktop-theme-sync" \
+    "${LIB_DST}/common.sh" \
+    "${LIB_DST}/update-gtk-settings-symlinks"
+  as_root rmdir "${LIB_DST}" 2>/dev/null || true
+
+  local link target
+  for link in /etc/gtk-3.0/settings.ini /etc/gtk-4.0/settings.ini; do
+    if [[ -L "${link}" ]]; then
+      target="$(readlink "${link}" || true)"
+      if [[ "${target}" == "${STATE_DIR}"/* ]]; then
+        as_root rm -f "${link}"
+      fi
+    fi
+  done
+  as_root rm -rf "${STATE_DIR}"
+  as_root systemctl daemon-reload
+  printf 'Removed %s\n' "${UNIT_NAME}"
+}
+
+main() {
+  need_cmd sudo
+  need_cmd systemctl
+
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --undo) undo ;;
+    "") install_files ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

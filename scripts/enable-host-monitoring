@@ -6,7 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SRC_DIR="${SCRIPT_DIR}/../config/host-monitoring"
+CONF_DIR="${SCRIPT_DIR}/../config/host-monitoring"
+LIB_DIR="${SCRIPT_DIR}/../lib/host-monitoring"
 UDEV_DST="${UDEV_DST:-/etc/udev/rules.d/99-rapl-readable.rules}"
 CAPS_UNIT_DST="${CAPS_UNIT_DST:-/etc/systemd/system/nethogs-caps.service}"
 CAPS_UNIT_NAME="nethogs-caps.service"
@@ -24,7 +25,7 @@ Usage: enable-host-monitoring [--configure-only] [--undo]
   Configures the host for system monitoring tools (not app-specific):
 
     - CPU power (W)          → readable RAPL energy_uj (udev + chmod)
-    - Per-process network    → nethogs + capabilities (boot oneshot)
+    - Per-process network    → copy nethogs to /usr/local/bin + setcap (Silverblue-safe)
     - Disk SMART             → smartmontools (smartctl)
     - Fans / sensors         → lm_sensors (+ sensors-detect --auto)
 
@@ -32,7 +33,7 @@ Usage: enable-host-monitoring [--configure-only] [--undo]
   (or run again — configure runs automatically when packages are live).
 
   --configure-only   Skip rpm-ostree; only udev, caps, sensors
-  --undo             Remove udev rule + caps oneshot (keeps layered RPMs)
+  --undo             Remove udev rule, caps oneshot, /usr/local/bin/nethogs (keeps RPMs)
 EOF
 }
 
@@ -94,7 +95,7 @@ layer_packages() {
 }
 
 install_rapl_udev() {
-  local src="${SRC_DIR}/99-rapl-readable.rules"
+  local src="${CONF_DIR}/99-rapl-readable.rules"
   [[ -f "${src}" ]] || die "missing ${src}"
 
   as_root install -d -m 755 "$(dirname -- "${UDEV_DST}")"
@@ -116,11 +117,12 @@ install_rapl_udev() {
 }
 
 install_nethogs_caps() {
-  local src="${SRC_DIR}/nethogs-caps.service"
+  local src="${LIB_DIR}/nethogs-caps.service"
+  local local_bin="/usr/local/bin/nethogs"
   [[ -f "${src}" ]] || die "missing ${src}"
 
-  if ! command -v nethogs >/dev/null 2>&1 && [[ ! -x /usr/sbin/nethogs ]]; then
-    printf 'warning: nethogs not on PATH yet (reboot after layering?)\n' >&2
+  if [[ ! -x /usr/sbin/nethogs && ! -x /usr/bin/nethogs ]]; then
+    printf 'warning: RPM nethogs not present yet (reboot after layering?)\n' >&2
   fi
 
   as_root install -d -m 755 "$(dirname -- "${CAPS_UNIT_DST}")"
@@ -128,11 +130,11 @@ install_nethogs_caps() {
   as_root systemctl daemon-reload
   as_root systemctl enable --now "${CAPS_UNIT_NAME}"
 
-  local nethogs_bin=""
-  nethogs_bin="$(command -v nethogs 2>/dev/null || true)"
-  [[ -z "${nethogs_bin}" && -x /usr/sbin/nethogs ]] && nethogs_bin=/usr/sbin/nethogs
-  if [[ -n "${nethogs_bin}" ]] && command -v getcap >/dev/null 2>&1; then
-    printf 'nethogs caps: %s\n' "$(getcap "${nethogs_bin}" 2>/dev/null || echo '(none)')"
+  if [[ -x "${local_bin}" ]] && command -v getcap >/dev/null 2>&1; then
+    printf 'nethogs (capped): %s\n' "$(getcap "${local_bin}" 2>/dev/null || echo "${local_bin} (no caps)")"
+  else
+    printf 'warning: %s missing or uncapped — check: systemctl status %s\n' \
+      "${local_bin}" "${CAPS_UNIT_NAME}" >&2
   fi
 }
 
@@ -166,10 +168,10 @@ configure() {
 
 undo() {
   as_root systemctl disable --now "${CAPS_UNIT_NAME}" 2>/dev/null || true
-  as_root rm -f "${CAPS_UNIT_DST}" "${UDEV_DST}"
+  as_root rm -f "${CAPS_UNIT_DST}" "${UDEV_DST}" /usr/local/bin/nethogs
   as_root systemctl daemon-reload 2>/dev/null || true
   as_root udevadm control --reload 2>/dev/null || true
-  printf 'Removed RAPL udev rule and nethogs caps oneshot.\n'
+  printf 'Removed RAPL udev rule, nethogs caps oneshot, and /usr/local/bin/nethogs.\n'
   printf 'Layered RPMs (%s) left installed; remove with rpm-ostree uninstall if desired.\n' "${PKGS[*]}"
 }
 

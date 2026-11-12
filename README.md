@@ -40,9 +40,8 @@ To run a script directly:
 **Appearance**
 - `install-adw-gtk3`: adw-gtk3 theme for the host and Flatpak
 - `install-tela-icons`: Tela icons, including Flatpak access
-- `sync-gdm-settings`: copy your monitors, fonts and theme to the login screen
-- `enable-gdm-theme-sync`: keep GDM and system GTK settings in sync automatically
-- `enable-adw-gtk3-theme-sync`: switch adw-gtk3 between light and dark with the GNOME color scheme
+- `enable-desktop-theme-sync`: adw light/dark + system GTK settings.ini
+- `enable-gdm-session-sync`: live sync session settings/monitors into GDM on change
 
 **Desktop and auth**
 - `bind-terminal-shortcut`: bind Ctrl+Alt+T to `xdg-terminal-exec`
@@ -57,6 +56,7 @@ Where it makes sense, scripts support `--undo`. Run a script with `--help` to se
 ```text
 setup       interactive menu
 scripts/    one script per task
+lib/        programs installed under /usr/local/lib
 config/     files the scripts install
 ```
 
